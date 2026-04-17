@@ -1,0 +1,18 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.portWin": "COM23",
+  "idf.currentSetup": "C:\\Users\\saurabh.r\\esp\\v5.4.3\\esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "C:\\Users\\saurabh.r\\.espressif\\tools\\esp-clang\\esp-18.1.2_20240912\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\saurabh.r\\radar_wifi_csi\\build"
+  ],
+  "idf.flashType": "UART"
+}

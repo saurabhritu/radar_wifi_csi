@@ -13,6 +13,7 @@ idf_component_register(
         esp_http_server
         json
         log
+        esp_driver_gpio
 )
 
 # Link the math library for sqrtf() in wifi_csi.c

@@ -11,6 +11,18 @@ typedef enum {
     CSI_STATE_MOTION  = 1,
 } csi_motion_state_t;
 
+typedef enum {
+    CSI_ACT_STILL     = 0,
+    CSI_ACT_BREATHING = 1,
+    CSI_ACT_MOVING    = 2
+} csi_activity_t;
+
+typedef enum {
+    CSI_DIR_NONE      = 0,
+    CSI_DIR_TOWARD    = 1,
+    CSI_DIR_AWAY      = 2
+} csi_direction_t;
+
 /**
  * @brief Snapshot of the latest CSI processing results.
  *
@@ -18,6 +30,8 @@ typedef enum {
  */
 typedef struct {
     csi_motion_state_t motion_state;    /**< Current detection state           */
+    csi_activity_t     activity;        /**< Classified activity level         */
+    csi_direction_t    direction;       /**< Detected movement direction       */
     float              variance_score;  /**< Latest computed variance score     */
     uint8_t            num_subcarriers; /**< Number of active subcarriers       */
     float              amplitudes[128]; /**< Per-subcarrier amplitudes (latest) */

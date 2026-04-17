@@ -6,7 +6,8 @@
   "idf.portWin": "COM23",
   "idf.currentSetup": "C:\\Users\\saurabh.r\\esp\\v5.4.3\\esp-idf",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32s3"
+    "IDF_TARGET": "esp32s3",
+    "OPENOCD_USB_ADAPTER_LOCATION": "2-3"
   },
   "clangd.path": "C:\\Users\\saurabh.r\\.espressif\\tools\\esp-clang\\esp-18.1.2_20240912\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [

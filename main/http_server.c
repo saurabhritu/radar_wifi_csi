@@ -67,6 +67,19 @@ static void ws_push_task(void *arg)
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "status",
             st.motion_state == CSI_STATE_MOTION ? "MOTION_DETECTED" : "CLEAR");
+        
+        /* Activity classification */
+        const char *act_str = "STILL";
+        if (st.activity == CSI_ACT_BREATHING) act_str = "BREATHING";
+        if (st.activity == CSI_ACT_MOVING)    act_str = "MOVING";
+        cJSON_AddStringToObject(root, "activity", act_str);
+
+        /* Direction detection */
+        const char *dir_str = "NONE";
+        if (st.direction == CSI_DIR_TOWARD) dir_str = "TOWARD";
+        if (st.direction == CSI_DIR_AWAY)   dir_str = "AWAY";
+        cJSON_AddStringToObject(root, "direction", dir_str);
+
         cJSON_AddNumberToObject(root, "variance",     (double)st.variance_score);
         cJSON_AddNumberToObject(root, "subcarriers",  st.num_subcarriers);
         cJSON_AddNumberToObject(root, "event_count",  st.motion_event_count);
@@ -160,8 +173,9 @@ esp_err_t http_server_start(void)
 
     httpd_config_t cfg    = HTTPD_DEFAULT_CONFIG();
     cfg.server_port       = 80;
-    cfg.max_open_sockets  = 5;
+    cfg.max_open_sockets  = 4;      /* Lowered to fit within LWIP_MAX_SOCKETS limit */
     cfg.lru_purge_enable  = true;
+    cfg.stack_size        = 10240;  /* Increased for robust processing */
 
     ESP_LOGI(TAG, "Starting HTTP server on port %d", cfg.server_port);
     if (httpd_start(&s_server, &cfg) != ESP_OK) {

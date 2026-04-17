@@ -22,8 +22,8 @@ static const char *TAG = "main";
 /* ╔═══════════════════════════════════════╗
    ║  ▶  SET YOUR WI-FI CREDENTIALS HERE  ║
    ╚═══════════════════════════════════════╝ */
-#define WIFI_SSID     "abcde"
-#define WIFI_PASSWORD "abcde@123"
+#define WIFI_SSID     "Stacksr"
+#define WIFI_PASSWORD "Stacksr@7276"
 
 /* ── Motion detection tuning ─────────────────────────── */
 #define ALERT_THRESHOLD        20.0f  /* variance score → motion            */

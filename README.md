@@ -1,94 +1,204 @@
-# 📡 Wi-Fi CSI Human Radar
+# Wi-Fi CSI Presence Radar
 
-> **Privacy-first human motion detection using Wi-Fi CSI on ESP32-S3.**
+ESP32-S3 firmware for a practical Wi-Fi CSI radar that follows the development path you described:
 
-Detects physical movement in an environment through signal disturbances—without cameras, microphones, or dedicated PIR sensors. This project leverages **Wi-Fi Channel State Information (CSI)** to provide high-precision, edge-based occupancy and motion sensing.
+1. prove raw CSI capture
+2. ship presence detection first
+3. separate micromotion from macro motion
+4. package it as a home-friendly sensor
 
----
+The firmware now exposes the end-goal states directly:
 
-## 🚀 Overview
+- `no_presence`
+- `presence_static`
+- `presence_micromotion`
+- `presence_motion`
 
-The **Wi-Fi CSI Human Radar** transforms a standard ESP32-S3 into a sophisticated environment sensor. By analyzing the subcarrier amplitudes of Wi-Fi packets (CSI), the system calculates signal variance triggers when human movement disrupts the multipath propagation.
+## What Was Taken From `Awesome-WiFi-CSI-Sensing`
 
-### 🌟 Key Features
-- **Privacy-Preserving**: No visual or audio data is captured. Detection is based entirely on radio frequency disturbances.
-- **Edge Intelligence**: All signal processing and motion detection algorithms run locally on the ESP32-S3.
-- **Real-Time Dashboard**: An embedded high-performance WebSocket dashboard featuring:
-  - **Polar Radar Sweep**: Dynamic visual representation of motion events.
-  - **CSI Waveform**: Live visualization of subcarrier amplitudes.
-  - **HUD (Heads-Up Display)**: Real-time status, variance scores, and event logging.
-- **Tunable Logic**: Adjust sensitivity thresholds and frame confirmation counts at runtime via the web UI.
-- **Self-Healing Wi-Fi**: Infinite reconnection logic with 30s smart backoff ensures the device recovers automatically from network outages.
-- **Micro-Latency**: Direct WebSocket streaming ensures minimal delay between physical movement and visual feedback.
+The NTUMARS list is most useful here as a map of the space rather than a single implementation. For this repo, the most actionable sublinks were:
 
----
+- [`ESP32-CSI-Tool`](https://github.com/StevenMHernandez/ESP32-CSI-Tool)
+  It shows the fastest path to phase 1: emit `CSI_DATA` lines over serial and log on the host PC.
+- [`espressif/esp-csi`](https://github.com/espressif/esp-csi)
+  Its `get-started` examples validate the ESP32 capture path, and the `esp-radar` examples show how Espressif productizes CSI sensing.
+- [`esp_wifi_sensing`](https://components.espressif.com/components/espressif/esp_wifi_sensing/versions/0.1.0/readme)
+  The useful product ideas are dynamic baseline tracking, debounce/hysteresis, ping-assisted sampling, and diagnostics-friendly state output.
+- The occupancy-detection section of the awesome list
+  That section reinforces that occupancy/presence is the right first robust milestone before trying harder activity recognition tasks.
 
-## 🚥 LED Status Indicators (XIAO ESP32-S3)
+This implementation borrows those ideas directly:
 
-The onboard orange LED (**GPIO 21**) provides real-time biometric and system feedback:
+- raw per-packet serial logging for capture validation
+- queued CSI processing instead of heavy work in the Wi-Fi callback
+- empty-room calibration plus slow drift compensation
+- hysteretic FSM output rather than a single raw threshold
 
-| State | LED Pattern | Description |
-| :--- | :--- | :--- |
-| **Connecting / Searching** | Slow Pulse | 500ms ON / 500ms OFF |
-| **Disconnected / Error** | Rapid Flicker | 100ms ON / 100ms OFF |
-| **Online (Still)** | Single Blip | Short 50ms flash every 2s (System Alive) |
-| **Breathing Detected** | Double Blip | "Heartbeat" pattern (Biometric Pulse) |
-| **Motion Detected** | **Steady ON** | Solid glow during active movement |
+## Current Firmware Behavior
 
----
+### Phase 1: Raw CSI Capture
 
-## 🛠 Hardware Required
+The device emits host-loggable lines in this format:
 
-- **ESP32-S3 Development Board** (Required for CSI support on internal Wi-Fi stack).
-- A stable 2.4GHz Wi-Fi Access Point (AP).
-
----
-
-## 🚦 Quick Start
-
-### 1. Configure Wi-Fi
-Open [main.c](main/main.c) and update your Wi-Fi credentials:
-
-```c
-#define WIFI_SSID     "YOUR_SSID"
-#define WIFI_PASSWORD "YOUR_PASSWORD"
+```text
+CSI_DATA_HEADER,<csv_column_names...>
+CSI_DATA,<timestamp_us>,<rssi>,<num_subcarriers>,...,<iq_vector>
 ```
 
-### 2. Build and Flash
-Ensure you have the [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/index.html) environment set up.
+Each packet includes:
+
+- timestamp
+- RSSI
+- packet rate and subcarrier counts
+- raw energies and normalization references
+- live thresholds and FSM counters
+- CSI vector
+- current radar state and scores
+
+Serial debug capture example:
 
 ```bash
-# Set target to ESP32-S3
-idf.py set-target esp32s3
+idf.py monitor | grep "CSI_DATA" > csi_session.csv
+```
 
-# Build and flash the project
+Recommended high-rate host capture:
+
+```bash
+node tools/capture_ws.mjs ws://<ESP32-IP>/ws/log session.csv
+```
+
+The firmware now exposes three capture paths:
+
+- `ws://<ESP32-IP>/ws/log`
+  Dedicated high-rate CSV log stream for serious experiments. Use this with `tools/capture_ws.mjs`.
+- browser capture
+  Open the web UI, click `Start Browser Capture (light)`, then `Stop Browser Capture & Download`. This is intentionally decimated and chunked so it does not compete with dashboard responsiveness.
+- serial logging
+  Useful for quick debugging or when you already have USB attached, but it is no longer the recommended path for high-rate sessions.
+
+You can now stage a session in this order:
+
+1. start `node tools/capture_ws.mjs ws://<ESP32-IP>/ws/log session.csv` on your computer if you want a full-rate capture
+2. turn on raw logging if you also want serial debug output
+3. click `Start Browser Capture (light)` only if you want a convenience browser-downloaded CSV
+4. click `Start Detection` to begin a fresh calibration and live classification
+
+Notes:
+
+- `raw_logging_enabled` is off by default.
+- If serial throughput becomes the bottleneck, set a high monitor baud rate such as `921600`.
+- The firmware now supports two roles: `sensor_sta` and `dedicated_ap`.
+- The `/ws/log` path is designed so if the host logger falls behind, rows for that sink are dropped instead of stalling CSI processing or the UI.
+
+### Phase 2: Presence First
+
+The radar computes:
+
+- per-frame amplitude extraction
+- frame mean normalization and detrending
+- subcarrier filtering
+- short/slow feature tracking
+- occupancy score against an empty-room baseline
+- motion energy over time
+- thresholding plus hysteresis
+
+This yields the first meaningful output:
+
+- `no_presence`
+- `presence_static`
+
+### Phase 3: Micromotion
+
+Micromotion is separated from macro motion using:
+
+- short-window temporal energy
+- macro-motion score with peak weighting
+- stability score
+- persistence counters
+
+This extends the classifier to:
+
+- `presence_micromotion`
+- `presence_motion`
+
+### Phase 4: Productization
+
+The firmware adds:
+
+- manual empty-room recalibration
+- a calibration guard that blocks baseline learning if the scene looks occupied
+- a `Force calibration` override for intentional occupied-scene calibration
+- slow drift compensation only when the room looks quiet
+- disturbance counter for low-confidence events like fans/doors/router traffic
+- dashboard controls for motion threshold, notch filtering, and raw logging
+- a dedicated ESP32 SoftAP mode that emits steady UDP broadcast traffic for cleaner CSI sessions
+
+## Dedicated AP Mode
+
+If your home router is busy with TV streaming, phones, or other devices, a second ESP32 running as a dedicated AP will usually work better for CSI experiments.
+
+Why it helps:
+
+- fixed channel and simpler RF environment
+- fewer unrelated packets and less traffic burstiness
+- more repeatable packet cadence
+- easier placement because only the sensor ESP32 joins that AP
+
+The improvement is usually strongest for:
+
+- more stable packet rate
+- cleaner calibration
+- easier threshold tuning
+
+It will not solve everything by itself. Geometry still matters, and static presence is still harder than obvious motion.
+
+To use it:
+
+1. In [`main/main.c`](/Users/saurabhritu/Code/radar_wifi_csi/main/main.c), flash one board with `DEVICE_ROLE = CSI_WIFI_ROLE_DEDICATED_AP`.
+2. Flash the sensing board with `DEVICE_ROLE = CSI_WIFI_ROLE_SENSOR_STA`.
+3. Use the same `WIFI_SSID` and `WIFI_PASSWORD` on both boards.
+4. Keep `WIFI_AP_CHANNEL` fixed, then place the two boards a few meters apart.
+5. Open the sensor board dashboard, start capture, then start detection.
+
+The AP board serves a small status page too, but it does not run detection. Its job is to provide a clean Wi-Fi source plus periodic broadcast packets for the sensor board.
+
+## Dashboard
+
+Open:
+
+```text
+http://<ESP32-IP>/
+```
+
+The dashboard shows:
+
+- current 4-state radar output
+- occupancy, micromotion, motion, and stability scores
+- calibration progress
+- capture mode status for browser, serial, and local WebSocket logging
+- live subcarrier amplitude envelope
+- a rolling waterfall heatmap
+- disturbance and presence event counts
+
+## Build
+
+Update the role and Wi-Fi settings in [`main/main.c`](/Users/saurabhritu/Code/radar_wifi_csi/main/main.c), then build with ESP-IDF:
+
+```bash
+idf.py set-target esp32s3
 idf.py build flash monitor
 ```
 
-### 3. Access Dashboard
-Once flashed, find the device's IP address in the serial monitor and open it in your browser:
-`http://<ESP32-IP>/`
+## Tuning Guidance
 
----
+- Start with an empty-room recalibration.
+- Leave `motion_threshold` around `1.35` for first tests.
+- If ceiling fans or periodic motion create false alarms, use the notch slider.
+- Validate the phase-1 capture path first by collecting `CSI_DATA` logs on the host.
+- Only after presence is stable should you spend time tuning micromotion sensitivity.
 
-## 🧠 Technical Details
+## Limitations
 
-### CSI Engine
-The system captures CSI data from incoming Wi-Fi packets. It focuses on the **Amplitude** of the subcarriers. A ring buffer stores historical amplitudes to calculate a standard deviation (variance) score. When the variance exceeds the `ALERT_THRESHOLD`, a motion state is triggered.
-
-### Self-Healing Wi-Fi
-The system is designed for 24/7 standalone operation. If the link is dropped:
-- **Phase 1 (Fast)**: 5 attempts are made immediately.
-- **Phase 2 (Patient)**: If persistent, the device waits **30 seconds** between retries indefinitely.
-- **Visual Status**: The onboard LED remains in "Searching" mode (Slow Pulse) throughout this process to signal it is attempting recovery.
-
-### Software Stack
-- **Framework**: ESP-IDF (C-based)
-- **Networking**: ESP-NETIF, FreeRTOS
-- **Web Interface**: Vanilla JS + HTML5 Canvas (embedded in `dashboard.h`)
-- **Communication**: HTTP Server with WebSocket protocols
-
----
-
-## ⚖️ License
-This project is open-source. Feel free to fork, modify, and improve the radar logic!
+- This is still single-device ESP32 CSI sensing, so it is better at robust occupancy states than precise direction, counting, or pose estimation.
+- Host-PC logging is implemented; SD-card logging is not yet added in this repo.
+- Thresholds still need room-by-room tuning on real hardware.

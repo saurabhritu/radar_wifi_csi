@@ -8,3 +8,6 @@ CONFIG_ESP_TIMER_TASK_STACK_SIZE=5120
 
 # Networking Limits - Increased for WebSocket stability
 CONFIG_LWIP_MAX_SOCKETS=16
+
+# Enable Wi-Fi CSI
+CONFIG_ESP_WIFI_CSI_ENABLED=y

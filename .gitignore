@@ -71,8 +71,15 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
+# Project specific data logs
+session*.csv
+
+# Tool cache
+.cache/
+
 # User-specific configuration files
 *.user
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+.vscode/ # VSCode specific files

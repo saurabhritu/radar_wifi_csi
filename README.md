@@ -121,6 +121,44 @@ This extends the classifier to:
 - `presence_micromotion`
 - `presence_motion`
 
+### Parallel Hybrid Detector
+
+The firmware also runs a realtime three-state hybrid detector in parallel with
+the original FSM. It uses a fast `motion_score` gate for `presence_motion`, then
+uses frame-normalized selected-subcarrier `shift_score` for static presence and
+clear-room recovery. Micromotion remains telemetry only in this path because
+the recent captures show selected micro energy is still noisier than selected
+shift.
+
+The realtime hybrid detector uses these starting gates:
+
+- motion enter: `motion_score >= 0.90` or `rhythm_motion_score >= 1.45` for 5 frames
+- static enter: `selected_shift_score >= 0.62` for 8 frames
+- clear: `occupancy_score <= 0.55`, `motion_score <= 0.85`, and `rhythm_motion_score <= 1.05` for 28 frames
+- motion hold: 20 frames after motion to reduce flicker
+- static hold: 45 frames after static evidence so still presence remains visible
+
+It also exposes visual-inspired telemetry:
+
+- `shape_shift_score`: full-envelope shape difference from empty-room baseline, telemetry only
+- `rhythm_motion_score`: rolling normalized envelope movement for walking-like motion
+- `patch_activity_score`: localized heatmap-like activity
+- `micro_activity`: experimental flag when selected micro energy persists during static presence
+
+Hybrid telemetry is exposed in the dashboard and CSV as:
+
+- `hybrid_presence_state`
+- `hybrid_motion_frames`
+- `hybrid_micro_frames`
+- `hybrid_static_frames`
+- `hybrid_clear_frames`
+- `hybrid_motion_hold_frames`
+- `hybrid_static_hold_frames`
+
+Use `hybrid_presence_state` as the practical realtime state while tuning. Keep
+the primary `presence_state` beside it as a diagnostic reference for the older
+four-state FSM.
+
 ### Phase 4: Productization
 
 The firmware adds:
@@ -173,12 +211,21 @@ http://<ESP32-IP>/
 The dashboard shows:
 
 - current 4-state radar output
+- guided setup quality, deployment readiness, and the main limiter for the current location
+- guided setup stages for empty-room, walk-through, still-presence, and clear-room validation
+- automatic transition settling plus optional manual sampling for each guided setup stage
+- suggested motion and presence thresholds from the guided setup run, with one-click profile application
+- downgraded `motion_only` guided profiles when static presence is not separable from clear-room samples
+- active motion, micromotion, and presence threshold controls for inspecting or overriding the profile
+- parallel selected-subcarrier detector telemetry for shift, macro, and micro features
+- parallel hybrid detector output using active motion thresholds plus selected-subcarrier shift
 - occupancy, micromotion, motion, and stability scores
 - calibration progress
 - capture mode status for browser, serial, and local WebSocket logging
 - live subcarrier amplitude envelope
 - a rolling waterfall heatmap
 - disturbance and presence event counts
+- packet-rate jitter, RSSI range, usable subcarriers, and CSI queue drops
 
 ## Build
 

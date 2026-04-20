@@ -65,6 +65,13 @@ static const char *CAPTURE_HEADER =
     "occupancy_ref,motion_ref,"
     "motion_threshold,motion_enter,motion_clear,"
     "micro_enter,micro_clear,presence_enter,presence_clear,"
+    "selected_presence_state,selected_shift_score,selected_macro_score,selected_micro_score,"
+    "selected_shift_raw,selected_macro_raw,selected_micro_raw,"
+    "selected_shift_ref,selected_macro_ref,selected_micro_ref,selected_subcarrier_count,"
+    "shape_shift_score,rhythm_motion_score,patch_activity_score,"
+    "shape_shift_raw,rhythm_motion_raw,patch_activity_raw,"
+    "shape_shift_ref,rhythm_motion_ref,patch_activity_ref,micro_activity,micro_activity_frames,"
+    "hybrid_presence_state,hybrid_motion_frames,hybrid_micro_frames,hybrid_static_frames,hybrid_clear_frames,hybrid_motion_hold_frames,hybrid_static_hold_frames,"
     "macro_frames,micro_frames,static_frames,clear_frames,presence_hold_frames,"
     "state_event_count,disturbance_count,notch_hz,last_timestamp_us,src_mac,iq_vector";
 
@@ -301,6 +308,10 @@ static void status_ws_push_task(void *arg)
                                 (double)st.stability_score);
         cJSON_AddNumberToObject(root, "packet_rate_hz",
                                 (double)st.packet_rate_hz);
+        cJSON_AddNumberToObject(root, "packet_rate_jitter_hz",
+                                (double)st.packet_rate_jitter_hz);
+        cJSON_AddNumberToObject(root, "rssi_avg",
+                                (double)st.rssi_avg);
         cJSON_AddNumberToObject(root, "occupancy_energy",
                                 (double)st.occupancy_energy);
         cJSON_AddNumberToObject(root, "motion_avg_energy",
@@ -323,6 +334,64 @@ static void status_ws_push_task(void *arg)
                                 (double)st.presence_enter_threshold);
         cJSON_AddNumberToObject(root, "presence_clear_threshold",
                                 (double)st.presence_clear_threshold);
+        cJSON_AddStringToObject(root, "selected_presence",
+                                csi_presence_state_to_string(st.selected_presence_state));
+        cJSON_AddStringToObject(root, "hybrid_presence",
+                                csi_presence_state_to_string(st.hybrid_presence_state));
+        cJSON_AddNumberToObject(root, "selected_shift_score",
+                                (double)st.selected_shift_score);
+        cJSON_AddNumberToObject(root, "selected_macro_score",
+                                (double)st.selected_macro_score);
+        cJSON_AddNumberToObject(root, "selected_micro_score",
+                                (double)st.selected_micro_score);
+        cJSON_AddNumberToObject(root, "selected_shift_raw",
+                                (double)st.selected_shift_raw);
+        cJSON_AddNumberToObject(root, "selected_macro_raw",
+                                (double)st.selected_macro_raw);
+        cJSON_AddNumberToObject(root, "selected_micro_raw",
+                                (double)st.selected_micro_raw);
+        cJSON_AddNumberToObject(root, "selected_shift_ref",
+                                (double)st.selected_shift_ref);
+        cJSON_AddNumberToObject(root, "selected_macro_ref",
+                                (double)st.selected_macro_ref);
+        cJSON_AddNumberToObject(root, "selected_micro_ref",
+                                (double)st.selected_micro_ref);
+        cJSON_AddNumberToObject(root, "shape_shift_score",
+                                (double)st.shape_shift_score);
+        cJSON_AddNumberToObject(root, "rhythm_motion_score",
+                                (double)st.rhythm_motion_score);
+        cJSON_AddNumberToObject(root, "patch_activity_score",
+                                (double)st.patch_activity_score);
+        cJSON_AddNumberToObject(root, "shape_shift_raw",
+                                (double)st.shape_shift_raw);
+        cJSON_AddNumberToObject(root, "rhythm_motion_raw",
+                                (double)st.rhythm_motion_raw);
+        cJSON_AddNumberToObject(root, "patch_activity_raw",
+                                (double)st.patch_activity_raw);
+        cJSON_AddNumberToObject(root, "shape_shift_ref",
+                                (double)st.shape_shift_ref);
+        cJSON_AddNumberToObject(root, "rhythm_motion_ref",
+                                (double)st.rhythm_motion_ref);
+        cJSON_AddNumberToObject(root, "patch_activity_ref",
+                                (double)st.patch_activity_ref);
+        cJSON_AddNumberToObject(root, "micro_activity",
+                                st.micro_activity ? 1 : 0);
+        cJSON_AddNumberToObject(root, "micro_activity_frames",
+                                st.micro_activity_frames);
+        cJSON_AddNumberToObject(root, "selected_subcarrier_count",
+                                st.selected_subcarrier_count);
+        cJSON_AddNumberToObject(root, "hybrid_motion_frames",
+                                st.hybrid_motion_frames);
+        cJSON_AddNumberToObject(root, "hybrid_micro_frames",
+                                st.hybrid_micro_frames);
+        cJSON_AddNumberToObject(root, "hybrid_static_frames",
+                                st.hybrid_static_frames);
+        cJSON_AddNumberToObject(root, "hybrid_clear_frames",
+                                st.hybrid_clear_frames);
+        cJSON_AddNumberToObject(root, "hybrid_motion_hold_frames",
+                                st.hybrid_motion_hold_frames);
+        cJSON_AddNumberToObject(root, "hybrid_static_hold_frames",
+                                st.hybrid_static_hold_frames);
         cJSON_AddNumberToObject(root, "subcarriers", st.num_subcarriers);
         cJSON_AddNumberToObject(root, "valid_subcarriers",
                                 st.valid_subcarriers);
@@ -331,6 +400,8 @@ static void status_ws_push_task(void *arg)
                                 st.disturbance_event_count);
         cJSON_AddNumberToObject(root, "processed_frame_count",
                                 st.processed_frame_count);
+        cJSON_AddNumberToObject(root, "queue_drop_count",
+                                st.queue_drop_count);
         cJSON_AddNumberToObject(root, "macro_frames", st.macro_frames);
         cJSON_AddNumberToObject(root, "micro_frames", st.micro_frames);
         cJSON_AddNumberToObject(root, "static_frames", st.static_frames);
@@ -370,8 +441,55 @@ static void status_ws_push_task(void *arg)
         cJSON_AddNumberToObject(root, "log_stream_clients",
                                 ws_client_count(s_log_ws_fds, s_log_ws_count));
         cJSON_AddNumberToObject(root, "last_rssi", st.last_rssi);
+        cJSON_AddNumberToObject(root, "min_rssi", st.min_rssi);
+        cJSON_AddNumberToObject(root, "max_rssi", st.max_rssi);
         cJSON_AddNumberToObject(root, "last_timestamp_us",
                                 (double)st.last_timestamp_us);
+        cJSON_AddNumberToObject(root, "deployment_ready",
+                                st.deployment_ready ? 1 : 0);
+        cJSON_AddNumberToObject(root, "setup_quality_score",
+                                (double)st.setup_quality_score);
+        cJSON_AddStringToObject(root, "setup_quality", st.setup_quality);
+        cJSON_AddStringToObject(root, "setup_step", st.setup_step);
+        cJSON_AddStringToObject(root, "setup_reason", st.setup_reason);
+        cJSON_AddNumberToObject(root, "guided_stage", st.guided_stage);
+        cJSON_AddNumberToObject(root, "guided_active",
+                                st.guided_active ? 1 : 0);
+        cJSON_AddNumberToObject(root, "guided_stage_samples",
+                                st.guided_stage_samples);
+        cJSON_AddNumberToObject(root, "guided_empty_motion_mean",
+                                (double)st.guided_empty_motion_mean);
+        cJSON_AddNumberToObject(root, "guided_walk_motion_peak",
+                                (double)st.guided_walk_motion_peak);
+        cJSON_AddNumberToObject(root, "guided_walk_motion_mean",
+                                (double)st.guided_walk_motion_mean);
+        cJSON_AddNumberToObject(root, "guided_still_occupancy_mean",
+                                (double)st.guided_still_occupancy_mean);
+        cJSON_AddNumberToObject(root, "guided_still_motion_mean",
+                                (double)st.guided_still_motion_mean);
+        cJSON_AddNumberToObject(root, "guided_clear_occupancy_mean",
+                                (double)st.guided_clear_occupancy_mean);
+        cJSON_AddNumberToObject(root, "guided_clear_motion_mean",
+                                (double)st.guided_clear_motion_mean);
+        cJSON_AddNumberToObject(root, "guided_suggested_motion_threshold",
+                                (double)st.guided_suggested_motion_threshold);
+        cJSON_AddNumberToObject(root, "guided_suggested_presence_enter",
+                                (double)st.guided_suggested_presence_enter);
+        cJSON_AddNumberToObject(root, "guided_profile_applied",
+                                st.guided_profile_applied ? 1 : 0);
+        cJSON_AddNumberToObject(root, "guided_manual_sampling",
+                                st.guided_manual_sampling ? 1 : 0);
+        cJSON_AddNumberToObject(root, "guided_sampling",
+                                st.guided_sampling ? 1 : 0);
+        cJSON_AddNumberToObject(root, "guided_settle_frames_remaining",
+                                st.guided_settle_frames_remaining);
+        cJSON_AddNumberToObject(root, "guided_motion_contrast",
+                                (double)st.guided_motion_contrast);
+        cJSON_AddNumberToObject(root, "guided_static_contrast",
+                                (double)st.guided_static_contrast);
+        cJSON_AddStringToObject(root, "guided_profile_mode",
+                                st.guided_profile_mode);
+        cJSON_AddStringToObject(root, "guided_result", st.guided_result);
         cJSON_AddStringToObject(root, "remote_addr", st.remote_addr);
 
         cJSON_AddStringToObject(root, "status",
@@ -579,6 +697,24 @@ static esp_err_t status_ws_handler(httpd_req_t *req)
                 if (strcmp(cmd->valuestring, "recalibrate") == 0) {
                     csi_engine_recalibrate();
                     ESP_LOGI(TAG, "Recalibration requested via WS");
+                } else if (strcmp(cmd->valuestring, "guided_setup_start") == 0) {
+                    csi_engine_guided_setup_start();
+                } else if (strcmp(cmd->valuestring, "guided_setup_advance") == 0) {
+                    csi_engine_guided_setup_advance();
+                } else if (strcmp(cmd->valuestring, "guided_setup_cancel") == 0) {
+                    csi_engine_guided_setup_cancel();
+                } else if (strcmp(cmd->valuestring, "guided_setup_apply_profile") == 0) {
+                    csi_engine_guided_setup_apply_profile();
+                } else if (strcmp(cmd->valuestring, "guided_setup_start_sampling") == 0) {
+                    csi_engine_guided_setup_start_sampling();
+                } else if (strcmp(cmd->valuestring, "guided_setup_set_manual_sampling") == 0) {
+                    cJSON *val = cJSON_GetObjectItem(msg, "value");
+                    if (cJSON_IsBool(val)) {
+                        csi_engine_guided_setup_set_manual_sampling(cJSON_IsTrue(val));
+                    } else if (cJSON_IsNumber(val)) {
+                        csi_engine_guided_setup_set_manual_sampling(
+                            val->valuedouble != 0.0);
+                    }
                 } else if (strcmp(cmd->valuestring, "set_force_calibration") == 0) {
                     cJSON *val = cJSON_GetObjectItem(msg, "value");
                     if (cJSON_IsBool(val)) {
@@ -603,6 +739,13 @@ static esp_err_t status_ws_handler(httpd_req_t *req)
                     cJSON *val = cJSON_GetObjectItem(msg, "value");
                     if (cJSON_IsNumber(val)) {
                         csi_engine_set_motion_threshold((float)val->valuedouble);
+                    }
+                } else if (strcmp(cmd->valuestring, "set_profile_threshold") == 0) {
+                    cJSON *name = cJSON_GetObjectItem(msg, "name");
+                    cJSON *val = cJSON_GetObjectItem(msg, "value");
+                    if (cJSON_IsString(name) && cJSON_IsNumber(val)) {
+                        csi_engine_set_profile_threshold(
+                            name->valuestring, (float)val->valuedouble);
                     }
                 } else if (strcmp(cmd->valuestring, "set_notch") == 0) {
                     cJSON *val = cJSON_GetObjectItem(msg, "value");

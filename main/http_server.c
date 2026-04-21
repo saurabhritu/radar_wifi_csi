@@ -60,19 +60,12 @@ static const char *CAPTURE_HEADER =
     "timestamp_us,rssi,num_subcarriers,valid_subcarriers,processed_frames,"
     "packet_rate_hz,detection_enabled,baseline_ready,calibration_percent,presence_state,"
     "manual_annotation,force_calibration_enabled,calibration_guard_blocked,calibration_guard_hits,"
-    "occupancy_score,micromotion_score,motion_score,stability_score,"
+    "occupancy_score,motion_score,stability_score,"
     "occupancy_energy,motion_avg_energy,motion_energy,"
     "occupancy_ref,motion_ref,"
     "motion_threshold,motion_enter,motion_clear,"
-    "micro_enter,micro_clear,presence_enter,presence_clear,"
-    "selected_presence_state,selected_shift_score,selected_macro_score,selected_micro_score,"
-    "selected_shift_raw,selected_macro_raw,selected_micro_raw,"
-    "selected_shift_ref,selected_macro_ref,selected_micro_ref,selected_subcarrier_count,"
-    "shape_shift_score,rhythm_motion_score,patch_activity_score,"
-    "shape_shift_raw,rhythm_motion_raw,patch_activity_raw,"
-    "shape_shift_ref,rhythm_motion_ref,patch_activity_ref,micro_activity,micro_activity_frames,"
-    "hybrid_presence_state,hybrid_motion_frames,hybrid_micro_frames,hybrid_static_frames,hybrid_clear_frames,hybrid_motion_hold_frames,hybrid_static_hold_frames,"
-    "macro_frames,micro_frames,static_frames,clear_frames,presence_hold_frames,"
+    "presence_enter,presence_clear,"
+    "macro_frames,static_frames,clear_frames,presence_hold_frames,"
     "state_event_count,disturbance_count,notch_hz,last_timestamp_us,src_mac,iq_vector";
 
 static void ws_remove_client(int *fds, int *count, int max_clients, int fd)
@@ -300,8 +293,6 @@ static void status_ws_push_task(void *arg)
                                 st.presence_state != CSI_PRESENCE_NO_PRESENCE ? 1 : 0);
         cJSON_AddNumberToObject(root, "occupancy_score",
                                 (double)st.occupancy_score);
-        cJSON_AddNumberToObject(root, "micromotion_score",
-                                (double)st.micromotion_score);
         cJSON_AddNumberToObject(root, "motion_score",
                                 (double)st.motion_score);
         cJSON_AddNumberToObject(root, "stability_score",
@@ -326,72 +317,10 @@ static void status_ws_push_task(void *arg)
                                 (double)st.motion_enter_threshold);
         cJSON_AddNumberToObject(root, "motion_clear_threshold",
                                 (double)st.motion_clear_threshold);
-        cJSON_AddNumberToObject(root, "micro_enter_threshold",
-                                (double)st.micro_enter_threshold);
-        cJSON_AddNumberToObject(root, "micro_clear_threshold",
-                                (double)st.micro_clear_threshold);
         cJSON_AddNumberToObject(root, "presence_enter_threshold",
                                 (double)st.presence_enter_threshold);
         cJSON_AddNumberToObject(root, "presence_clear_threshold",
                                 (double)st.presence_clear_threshold);
-        cJSON_AddStringToObject(root, "selected_presence",
-                                csi_presence_state_to_string(st.selected_presence_state));
-        cJSON_AddStringToObject(root, "hybrid_presence",
-                                csi_presence_state_to_string(st.hybrid_presence_state));
-        cJSON_AddNumberToObject(root, "selected_shift_score",
-                                (double)st.selected_shift_score);
-        cJSON_AddNumberToObject(root, "selected_macro_score",
-                                (double)st.selected_macro_score);
-        cJSON_AddNumberToObject(root, "selected_micro_score",
-                                (double)st.selected_micro_score);
-        cJSON_AddNumberToObject(root, "selected_shift_raw",
-                                (double)st.selected_shift_raw);
-        cJSON_AddNumberToObject(root, "selected_macro_raw",
-                                (double)st.selected_macro_raw);
-        cJSON_AddNumberToObject(root, "selected_micro_raw",
-                                (double)st.selected_micro_raw);
-        cJSON_AddNumberToObject(root, "selected_shift_ref",
-                                (double)st.selected_shift_ref);
-        cJSON_AddNumberToObject(root, "selected_macro_ref",
-                                (double)st.selected_macro_ref);
-        cJSON_AddNumberToObject(root, "selected_micro_ref",
-                                (double)st.selected_micro_ref);
-        cJSON_AddNumberToObject(root, "shape_shift_score",
-                                (double)st.shape_shift_score);
-        cJSON_AddNumberToObject(root, "rhythm_motion_score",
-                                (double)st.rhythm_motion_score);
-        cJSON_AddNumberToObject(root, "patch_activity_score",
-                                (double)st.patch_activity_score);
-        cJSON_AddNumberToObject(root, "shape_shift_raw",
-                                (double)st.shape_shift_raw);
-        cJSON_AddNumberToObject(root, "rhythm_motion_raw",
-                                (double)st.rhythm_motion_raw);
-        cJSON_AddNumberToObject(root, "patch_activity_raw",
-                                (double)st.patch_activity_raw);
-        cJSON_AddNumberToObject(root, "shape_shift_ref",
-                                (double)st.shape_shift_ref);
-        cJSON_AddNumberToObject(root, "rhythm_motion_ref",
-                                (double)st.rhythm_motion_ref);
-        cJSON_AddNumberToObject(root, "patch_activity_ref",
-                                (double)st.patch_activity_ref);
-        cJSON_AddNumberToObject(root, "micro_activity",
-                                st.micro_activity ? 1 : 0);
-        cJSON_AddNumberToObject(root, "micro_activity_frames",
-                                st.micro_activity_frames);
-        cJSON_AddNumberToObject(root, "selected_subcarrier_count",
-                                st.selected_subcarrier_count);
-        cJSON_AddNumberToObject(root, "hybrid_motion_frames",
-                                st.hybrid_motion_frames);
-        cJSON_AddNumberToObject(root, "hybrid_micro_frames",
-                                st.hybrid_micro_frames);
-        cJSON_AddNumberToObject(root, "hybrid_static_frames",
-                                st.hybrid_static_frames);
-        cJSON_AddNumberToObject(root, "hybrid_clear_frames",
-                                st.hybrid_clear_frames);
-        cJSON_AddNumberToObject(root, "hybrid_motion_hold_frames",
-                                st.hybrid_motion_hold_frames);
-        cJSON_AddNumberToObject(root, "hybrid_static_hold_frames",
-                                st.hybrid_static_hold_frames);
         cJSON_AddNumberToObject(root, "subcarriers", st.num_subcarriers);
         cJSON_AddNumberToObject(root, "valid_subcarriers",
                                 st.valid_subcarriers);
@@ -403,7 +332,6 @@ static void status_ws_push_task(void *arg)
         cJSON_AddNumberToObject(root, "queue_drop_count",
                                 st.queue_drop_count);
         cJSON_AddNumberToObject(root, "macro_frames", st.macro_frames);
-        cJSON_AddNumberToObject(root, "micro_frames", st.micro_frames);
         cJSON_AddNumberToObject(root, "static_frames", st.static_frames);
         cJSON_AddNumberToObject(root, "clear_frames", st.clear_frames);
         cJSON_AddNumberToObject(root, "presence_hold_frames",
@@ -477,8 +405,6 @@ static void status_ws_push_task(void *arg)
                                 (double)st.guided_suggested_presence_enter);
         cJSON_AddNumberToObject(root, "guided_profile_applied",
                                 st.guided_profile_applied ? 1 : 0);
-        cJSON_AddNumberToObject(root, "guided_manual_sampling",
-                                st.guided_manual_sampling ? 1 : 0);
         cJSON_AddNumberToObject(root, "guided_sampling",
                                 st.guided_sampling ? 1 : 0);
         cJSON_AddNumberToObject(root, "guided_settle_frames_remaining",
@@ -707,14 +633,6 @@ static esp_err_t status_ws_handler(httpd_req_t *req)
                     csi_engine_guided_setup_apply_profile();
                 } else if (strcmp(cmd->valuestring, "guided_setup_start_sampling") == 0) {
                     csi_engine_guided_setup_start_sampling();
-                } else if (strcmp(cmd->valuestring, "guided_setup_set_manual_sampling") == 0) {
-                    cJSON *val = cJSON_GetObjectItem(msg, "value");
-                    if (cJSON_IsBool(val)) {
-                        csi_engine_guided_setup_set_manual_sampling(cJSON_IsTrue(val));
-                    } else if (cJSON_IsNumber(val)) {
-                        csi_engine_guided_setup_set_manual_sampling(
-                            val->valuedouble != 0.0);
-                    }
                 } else if (strcmp(cmd->valuestring, "set_force_calibration") == 0) {
                     cJSON *val = cJSON_GetObjectItem(msg, "value");
                     if (cJSON_IsBool(val)) {

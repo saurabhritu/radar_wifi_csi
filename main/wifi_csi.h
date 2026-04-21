@@ -19,8 +19,7 @@
 typedef enum {
     CSI_PRESENCE_NO_PRESENCE = 0,
     CSI_PRESENCE_STATIC      = 1,
-    CSI_PRESENCE_MICROMOTION = 2,
-    CSI_PRESENCE_MOTION      = 3,
+    CSI_PRESENCE_MOTION      = 2,
 } csi_presence_state_t;
 
 typedef enum {
@@ -40,8 +39,6 @@ typedef enum {
 typedef struct {
     float motion_enter;
     float motion_clear;
-    float micro_enter;
-    float micro_clear;
     float presence_enter;
     float presence_clear;
 } csi_detection_profile_t;
@@ -50,11 +47,12 @@ typedef struct {
  * @brief Snapshot of the latest CSI processing results.
  *
  * Populated by the CSI engine; read by the HTTP/WebSocket layer.
+ * Simplified for v1: 3-state detection using location-agnostic
+ * relative features (frame-normalized, self-calibrating).
  */
 typedef struct {
-    csi_presence_state_t presence_state;   /**< 4-state radar output               */
+    csi_presence_state_t presence_state;   /**< 3-state radar output               */
     float                occupancy_score;  /**< Empty-room deviation score         */
-    float                micromotion_score;/**< Low-energy temporal motion score   */
     float                motion_score;     /**< Macro-motion score                 */
     float                stability_score;  /**< High when presence is mostly static*/
     uint8_t              num_subcarriers;  /**< Number of active subcarriers       */
@@ -76,41 +74,9 @@ typedef struct {
     float                motion_ref;       /**< Normalization reference for motion */
     float                motion_enter_threshold; /**< Motion state entry threshold */
     float                motion_clear_threshold; /**< Motion state clear threshold */
-    float                micro_enter_threshold;  /**< Micromotion entry threshold */
-    float                micro_clear_threshold;  /**< Micromotion clear threshold */
     float                presence_enter_threshold; /**< Presence entry threshold   */
     float                presence_clear_threshold; /**< Presence clear threshold   */
-    csi_presence_state_t selected_presence_state; /**< Parallel selected-SC detector */
-    csi_presence_state_t hybrid_presence_state; /**< Motion + selected-shift detector */
-    float                selected_shift_score; /**< Selected baseline-shift score */
-    float                selected_macro_score; /**< Selected macro-delta score    */
-    float                selected_micro_score; /**< Selected rolling micro score  */
-    float                selected_shift_raw; /**< Normalized selected baseline shift */
-    float                selected_macro_raw; /**< Normalized selected frame delta */
-    float                selected_micro_raw; /**< Normalized selected rolling delta */
-    float                selected_shift_ref; /**< Empty reference for shift       */
-    float                selected_macro_ref; /**< Empty reference for macro       */
-    float                selected_micro_ref; /**< Empty reference for micro       */
-    float                shape_shift_score; /**< Full-envelope baseline shift score */
-    float                rhythm_motion_score; /**< Rhythmic envelope motion score */
-    float                patch_activity_score; /**< Local heatmap patch activity score */
-    float                shape_shift_raw; /**< Raw normalized envelope shift */
-    float                rhythm_motion_raw; /**< Raw normalized envelope rhythm */
-    float                patch_activity_raw; /**< Raw local patch activity */
-    float                shape_shift_ref; /**< Empty reference for shape shift */
-    float                rhythm_motion_ref; /**< Empty reference for rhythm */
-    float                patch_activity_ref; /**< Empty reference for patches */
-    bool                 micro_activity; /**< Experimental micro activity flag */
-    uint8_t              micro_activity_frames; /**< Consecutive micro activity frames */
-    uint8_t              selected_subcarrier_count; /**< Present selected subcarriers */
-    uint8_t              hybrid_motion_frames; /**< Hybrid consecutive motion frames */
-    uint8_t              hybrid_micro_frames; /**< Hybrid experimental micro frames */
-    uint8_t              hybrid_static_frames; /**< Hybrid consecutive static frames */
-    uint8_t              hybrid_clear_frames; /**< Hybrid consecutive clear frames */
-    uint8_t              hybrid_motion_hold_frames; /**< Hybrid anti-flicker hold */
-    uint8_t              hybrid_static_hold_frames; /**< Hybrid static display hold */
     uint8_t              macro_frames;     /**< Consecutive macro-motion frames    */
-    uint8_t              micro_frames;     /**< Consecutive micromotion frames     */
     uint8_t              static_frames;    /**< Consecutive static-presence frames */
     uint8_t              clear_frames;     /**< Consecutive clear frames           */
     uint8_t              presence_hold_frames; /**< Hold counter before clearing   */
@@ -147,7 +113,6 @@ typedef struct {
     float                guided_suggested_motion_threshold; /**< Suggested macro threshold */
     float                guided_suggested_presence_enter; /**< Suggested static threshold */
     bool                 guided_profile_applied; /**< True once suggestions applied */
-    bool                 guided_manual_sampling; /**< True when user starts stages */
     bool                 guided_sampling; /**< True while stage metrics collect   */
     uint16_t             guided_settle_frames_remaining; /**< Transition ignore frames */
     float                guided_motion_contrast; /**< Walk peak above empty motion */
@@ -230,7 +195,6 @@ void csi_engine_guided_setup_start(void);
 void csi_engine_guided_setup_advance(void);
 void csi_engine_guided_setup_cancel(void);
 void csi_engine_guided_setup_apply_profile(void);
-void csi_engine_guided_setup_set_manual_sampling(bool enabled);
 void csi_engine_guided_setup_start_sampling(void);
 
 /**

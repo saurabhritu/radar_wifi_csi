@@ -1,20 +1,14 @@
 /**
  * @file wifi_csi.c
- * @brief Wi-Fi CSI capture engine with four-state presence radar logic.
+ * @brief Wi-Fi CSI capture engine with three-state presence radar.
  *
- * This implementation follows the practical path suggested by the ESP32 CSI
- * Toolkit and Espressif's esp-csi / esp-radar material:
+ * Location-agnostic detection using relative feature engineering:
+ *   1. Frame-mean-normalized subcarrier amplitudes remove absolute gain.
+ *   2. Self-calibrating empty-room references adapt per deployment.
+ *   3. Guided setup measures site-specific contrast for threshold tuning.
  *
- * 1. Keep CSI capture lightweight in the Wi-Fi callback and push packets into a
- *    worker queue.
- * 2. Preserve a phase-1 deliverable by streaming raw `CSI_DATA,...` lines over
- *    serial so a host PC can log timestamp + RSSI + CSI vectors per packet.
- * 3. Learn an empty-room baseline, compensate drift only when the scene looks
- *    quiet, and expose a product-friendly four-state FSM:
- *       no_presence
- *       presence_static
- *       presence_micromotion
- *       presence_motion
+ * Three-state FSM output:
+ *   no_presence  →  presence_static  →  presence_motion
  */
 
 #include <math.h>
@@ -64,48 +58,19 @@
 #define CSI_MIN_MOTION_REF             0.20f
 #define CSI_BASELINE_CALIBRATION_FRAMES 80U
 #define CSI_STATIC_CONFIRM_FRAMES       16U
-#define CSI_MICRO_CONFIRM_FRAMES        10U
 #define CSI_PRESENCE_HOLD_FRAMES       220U
 #define CSI_DISTURBANCE_COOLDOWN_FRAMES 30U
 #define CSI_CALIBRATION_GUARD_COOLDOWN_FRAMES 20U
 #define CSI_DISPLAY_SUBCARRIERS         CSI_MAX_SUBCARRIERS
-#define CSI_CSV_ROW_MAX               3584U
+#define CSI_CSV_ROW_MAX               2048U
 #define CSI_SERIAL_LOG_MIN_INTERVAL_US 50000U
 #define CSI_BROWSER_CAPTURE_MIN_INTERVAL_US 50000U
 #define CSI_AP_DEFAULT_CHANNEL            6U
 #define CSI_AP_DEFAULT_BROADCAST_MS      20U
 #define CSI_AP_MAX_CLIENTS                4U
 #define CSI_AP_TRAFFIC_PORT            3333
-#define CSI_SELECTED_SUBCARRIER_COUNT    10U
-#define CSI_SELECTED_MACRO_ENTER       2.20f
-#define CSI_SELECTED_MACRO_CLEAR       1.35f
-#define CSI_SELECTED_SHIFT_ENTER       1.45f
-#define CSI_SELECTED_SHIFT_CLEAR       1.05f
-#define CSI_SELECTED_MICRO_ENTER       1.35f
-#define CSI_SELECTED_MICRO_CLEAR       1.05f
-#define CSI_SELECTED_MIN_SHIFT_REF     0.055f
-#define CSI_SELECTED_MIN_DELTA_REF     0.030f
-#define CSI_HYBRID_SHIFT_ENTER        0.62f
-#define CSI_HYBRID_SHIFT_CLEAR        0.60f
-#define CSI_HYBRID_MOTION_ENTER       0.90f
-#define CSI_HYBRID_MOTION_CLEAR       0.85f
-#define CSI_HYBRID_OCCUPANCY_CLEAR    0.55f
-#define CSI_HYBRID_MOTION_CONFIRM      5U
-#define CSI_HYBRID_STATIC_CONFIRM      8U
-#define CSI_HYBRID_CLEAR_CONFIRM      28U
-#define CSI_HYBRID_MOTION_HOLD        20U
-#define CSI_HYBRID_STATIC_HOLD        45U
-#define CSI_HYBRID_MICRO_ENTER        1.20f
-#define CSI_HYBRID_MICRO_CLEAR        0.90f
-#define CSI_VISUAL_RHYTHM_ENTER       1.45f
-#define CSI_VISUAL_RHYTHM_CLEAR       1.05f
-#define CSI_MICRO_ACTIVITY_CONFIRM    16U
 
 static const char *TAG = "csi_engine";
-
-static const uint8_t s_selected_subcarriers[CSI_SELECTED_SUBCARRIER_COUNT] = {
-    66, 79, 80, 81, 82, 83, 84, 85, 126, 127
-};
 
 typedef struct {
     uint64_t timestamp_us;
@@ -120,7 +85,6 @@ typedef struct {
     uint16_t samples;
     float occupancy_sum;
     float motion_sum;
-    float micromotion_sum;
     float stability_sum;
     float occupancy_peak;
     float motion_peak;
@@ -140,10 +104,7 @@ static uint16_t s_ap_broadcast_interval_ms = CSI_AP_DEFAULT_BROADCAST_MS;
 static uint8_t s_ap_channel = CSI_AP_DEFAULT_CHANNEL;
 
 static csi_presence_state_t s_presence_state = CSI_PRESENCE_NO_PRESENCE;
-static csi_presence_state_t s_selected_presence_state = CSI_PRESENCE_NO_PRESENCE;
-static csi_presence_state_t s_hybrid_presence_state = CSI_PRESENCE_NO_PRESENCE;
 static uint8_t s_macro_frames = 0;
-static uint8_t s_micro_frames = 0;
 static uint8_t s_static_frames = 0;
 static uint8_t s_clear_frames = 0;
 static uint8_t s_presence_hold_frames = 0;
@@ -151,20 +112,8 @@ static uint8_t s_disturbance_cooldown = 0;
 static uint32_t s_state_event_count = 0;
 static uint32_t s_disturbance_event_count = 0;
 static uint32_t s_processed_frames = 0;
-static uint8_t s_selected_macro_frames = 0;
-static uint8_t s_selected_micro_frames = 0;
-static uint8_t s_selected_static_frames = 0;
-static uint8_t s_selected_clear_frames = 0;
-static uint8_t s_hybrid_motion_frames = 0;
-static uint8_t s_hybrid_micro_frames = 0;
-static uint8_t s_hybrid_static_frames = 0;
-static uint8_t s_hybrid_clear_frames = 0;
-static uint8_t s_hybrid_motion_hold_frames = 0;
-static uint8_t s_hybrid_static_hold_frames = 0;
-static uint8_t s_micro_activity_frames = 0;
 
 static float s_occupancy_score = 0.0f;
-static float s_micromotion_score = 0.0f;
 static float s_motion_score = 0.0f;
 static float s_stability_score = 0.0f;
 static float s_packet_rate_hz = 0.0f;
@@ -177,40 +126,8 @@ static float s_last_occupancy_ref = 0.0f;
 static float s_last_motion_ref = 0.0f;
 static float s_last_motion_enter = 0.0f;
 static float s_last_motion_clear = 0.0f;
-static float s_last_micro_enter = 0.0f;
-static float s_last_micro_clear = 0.0f;
 static float s_last_presence_enter = 0.0f;
 static float s_last_presence_clear = 0.0f;
-static float s_selected_baseline[CSI_SELECTED_SUBCARRIER_COUNT];
-static float s_selected_prev_amp[CSI_SELECTED_SUBCARRIER_COUNT];
-static float s_selected_micro_ema[CSI_SELECTED_SUBCARRIER_COUNT];
-static bool s_selected_prev_ready[CSI_SELECTED_SUBCARRIER_COUNT];
-static float s_selected_shift_floor = 0.0f;
-static float s_selected_shift_jitter = 0.10f;
-static float s_selected_macro_floor = 0.0f;
-static float s_selected_macro_jitter = 0.10f;
-static float s_selected_micro_floor = 0.0f;
-static float s_selected_micro_jitter = 0.10f;
-static float s_selected_shift_score = 0.0f;
-static float s_selected_macro_score = 0.0f;
-static float s_selected_micro_score = 0.0f;
-static float s_selected_shift_raw = 0.0f;
-static float s_selected_macro_raw = 0.0f;
-static float s_selected_micro_raw = 0.0f;
-static float s_selected_shift_ref = 0.0f;
-static float s_selected_macro_ref = 0.0f;
-static float s_selected_micro_ref = 0.0f;
-static uint8_t s_selected_present_count = 0;
-static float s_shape_shift_score = 0.0f;
-static float s_rhythm_motion_score = 0.0f;
-static float s_patch_activity_score = 0.0f;
-static float s_shape_shift_raw = 0.0f;
-static float s_rhythm_motion_raw = 0.0f;
-static float s_patch_activity_raw = 0.0f;
-static float s_shape_shift_ref = 0.0f;
-static float s_rhythm_motion_ref = 0.0f;
-static float s_patch_activity_ref = 0.0f;
-static bool s_micro_activity = false;
 
 static uint8_t s_num_sc = 0;
 static uint8_t s_valid_sc = 0;
@@ -224,11 +141,6 @@ static float s_fast_features[CSI_MAX_SUBCARRIERS];
 static float s_slow_features[CSI_MAX_SUBCARRIERS];
 static float s_display_features[CSI_MAX_SUBCARRIERS];
 static float s_empty_baseline[CSI_MAX_SUBCARRIERS];
-static float s_visual_baseline[CSI_MAX_SUBCARRIERS];
-static float s_visual_prev_norm[CSI_MAX_SUBCARRIERS];
-static float s_visual_short_ema[CSI_MAX_SUBCARRIERS];
-static float s_visual_patch_jitter[CSI_MAX_SUBCARRIERS];
-static bool s_visual_prev_ready[CSI_MAX_SUBCARRIERS];
 static bool s_feature_filters_ready = false;
 static bool s_baseline_ready = false;
 static bool s_calibration_guard_blocked = false;
@@ -239,12 +151,6 @@ static float s_empty_floor = 0.0f;
 static float s_empty_jitter = 0.10f;
 static float s_motion_floor = 0.0f;
 static float s_motion_jitter = 0.10f;
-static float s_shape_shift_floor = 0.0f;
-static float s_shape_shift_jitter = 0.01f;
-static float s_rhythm_motion_floor = 0.0f;
-static float s_rhythm_motion_jitter = 0.01f;
-static float s_patch_activity_floor = 0.0f;
-static float s_patch_activity_jitter = 0.10f;
 static int8_t s_last_rssi = -127;
 static int8_t s_min_rssi = 127;
 static int8_t s_max_rssi = -127;
@@ -252,7 +158,6 @@ static uint64_t s_last_timestamp_us = 0;
 static volatile uint32_t s_csi_queue_drops = 0;
 static csi_setup_stage_t s_guided_stage = CSI_SETUP_IDLE;
 static bool s_guided_active = false;
-static bool s_guided_manual_sampling = false;
 static bool s_guided_sampling = false;
 static uint16_t s_guided_settle_frames_remaining = 0;
 static csi_setup_metrics_t s_guided_metrics[CSI_SETUP_COMPLETE + 1];
@@ -354,14 +259,10 @@ static csi_detection_profile_t profile_from_motion_threshold(float threshold)
 {
     csi_detection_profile_t profile;
     float motion_enter = clamp_motion_threshold(threshold);
-    float micro_enter;
     float presence_enter;
 
     profile.motion_enter = motion_enter;
     profile.motion_clear = fmaxf(0.80f, motion_enter * 0.78f);
-    micro_enter = fmaxf(0.60f, motion_enter * 0.57f);
-    profile.micro_enter = micro_enter;
-    profile.micro_clear = fmaxf(0.46f, micro_enter * 0.80f);
     presence_enter = fmaxf(0.98f, 0.98f + ((motion_enter - 1.0f) * 0.16f));
     profile.presence_enter = presence_enter;
     profile.presence_clear = fmaxf(0.82f, presence_enter * 0.86f);
@@ -375,10 +276,6 @@ static csi_detection_profile_t sanitize_detection_profile(
     profile.motion_enter = clamp_motion_threshold(profile.motion_enter);
     profile.motion_clear = clampf_local(profile.motion_clear, 0.40f,
                                         profile.motion_enter);
-    profile.micro_enter = clampf_local(profile.micro_enter, 0.30f,
-                                       profile.motion_enter);
-    profile.micro_clear = clampf_local(profile.micro_clear, 0.20f,
-                                       profile.micro_enter);
     profile.presence_enter = clampf_local(profile.presence_enter, 0.60f, 6.00f);
     profile.presence_clear = clampf_local(profile.presence_clear, 0.40f,
                                          profile.presence_enter);
@@ -470,8 +367,6 @@ const char *csi_presence_state_to_string(csi_presence_state_t state)
     switch (state) {
     case CSI_PRESENCE_STATIC:
         return "presence_static";
-    case CSI_PRESENCE_MICROMOTION:
-        return "presence_micromotion";
     case CSI_PRESENCE_MOTION:
         return "presence_motion";
     case CSI_PRESENCE_NO_PRESENCE:
@@ -564,21 +459,9 @@ static void reset_processing_state_locked(void)
     memset(s_slow_features, 0, sizeof(s_slow_features));
     memset(s_display_features, 0, sizeof(s_display_features));
     memset(s_empty_baseline, 0, sizeof(s_empty_baseline));
-    memset(s_visual_baseline, 0, sizeof(s_visual_baseline));
-    memset(s_visual_prev_norm, 0, sizeof(s_visual_prev_norm));
-    memset(s_visual_short_ema, 0, sizeof(s_visual_short_ema));
-    memset(s_visual_patch_jitter, 0, sizeof(s_visual_patch_jitter));
-    memset(s_visual_prev_ready, 0, sizeof(s_visual_prev_ready));
-    memset(s_selected_baseline, 0, sizeof(s_selected_baseline));
-    memset(s_selected_prev_amp, 0, sizeof(s_selected_prev_amp));
-    memset(s_selected_micro_ema, 0, sizeof(s_selected_micro_ema));
-    memset(s_selected_prev_ready, 0, sizeof(s_selected_prev_ready));
 
     s_presence_state = CSI_PRESENCE_NO_PRESENCE;
-    s_selected_presence_state = CSI_PRESENCE_NO_PRESENCE;
-    s_hybrid_presence_state = CSI_PRESENCE_NO_PRESENCE;
     s_macro_frames = 0;
-    s_micro_frames = 0;
     s_static_frames = 0;
     s_clear_frames = 0;
     s_presence_hold_frames = 0;
@@ -586,20 +469,8 @@ static void reset_processing_state_locked(void)
     s_state_event_count = 0;
     s_disturbance_event_count = 0;
     s_processed_frames = 0;
-    s_selected_macro_frames = 0;
-    s_selected_micro_frames = 0;
-    s_selected_static_frames = 0;
-    s_selected_clear_frames = 0;
-    s_hybrid_motion_frames = 0;
-    s_hybrid_micro_frames = 0;
-    s_hybrid_static_frames = 0;
-    s_hybrid_clear_frames = 0;
-    s_hybrid_motion_hold_frames = 0;
-    s_hybrid_static_hold_frames = 0;
-    s_micro_activity_frames = 0;
 
     s_occupancy_score = 0.0f;
-    s_micromotion_score = 0.0f;
     s_motion_score = 0.0f;
     s_stability_score = 0.0f;
     s_packet_rate_hz = 0.0f;
@@ -612,36 +483,8 @@ static void reset_processing_state_locked(void)
     s_last_motion_ref = 0.0f;
     s_last_motion_enter = 0.0f;
     s_last_motion_clear = 0.0f;
-    s_last_micro_enter = 0.0f;
-    s_last_micro_clear = 0.0f;
     s_last_presence_enter = 0.0f;
     s_last_presence_clear = 0.0f;
-    s_selected_shift_floor = 0.0f;
-    s_selected_shift_jitter = 0.10f;
-    s_selected_macro_floor = 0.0f;
-    s_selected_macro_jitter = 0.10f;
-    s_selected_micro_floor = 0.0f;
-    s_selected_micro_jitter = 0.10f;
-    s_selected_shift_score = 0.0f;
-    s_selected_macro_score = 0.0f;
-    s_selected_micro_score = 0.0f;
-    s_selected_shift_raw = 0.0f;
-    s_selected_macro_raw = 0.0f;
-    s_selected_micro_raw = 0.0f;
-    s_selected_shift_ref = 0.0f;
-    s_selected_macro_ref = 0.0f;
-    s_selected_micro_ref = 0.0f;
-    s_selected_present_count = 0;
-    s_shape_shift_score = 0.0f;
-    s_rhythm_motion_score = 0.0f;
-    s_patch_activity_score = 0.0f;
-    s_shape_shift_raw = 0.0f;
-    s_rhythm_motion_raw = 0.0f;
-    s_patch_activity_raw = 0.0f;
-    s_shape_shift_ref = 0.0f;
-    s_rhythm_motion_ref = 0.0f;
-    s_patch_activity_ref = 0.0f;
-    s_micro_activity = false;
 
     s_num_sc = 0;
     s_valid_sc = 0;
@@ -658,12 +501,6 @@ static void reset_processing_state_locked(void)
     s_empty_jitter = 0.10f;
     s_motion_floor = 0.0f;
     s_motion_jitter = 0.10f;
-    s_shape_shift_floor = 0.0f;
-    s_shape_shift_jitter = 0.01f;
-    s_rhythm_motion_floor = 0.0f;
-    s_rhythm_motion_jitter = 0.01f;
-    s_patch_activity_floor = 0.0f;
-    s_patch_activity_jitter = 0.10f;
     s_last_rssi = -127;
     s_min_rssi = 127;
     s_max_rssi = -127;
@@ -758,13 +595,11 @@ static void adapt_empty_baseline_locked(const float *slow_snapshot, uint8_t num_
 }
 
 static void smooth_scores_locked(float raw_occupancy_score,
-                                 float raw_micromotion_score,
                                  float raw_motion_score,
                                  float raw_stability_score)
 {
     if (s_processed_frames <= CSI_WARMUP_FRAMES) {
         s_occupancy_score = raw_occupancy_score;
-        s_micromotion_score = raw_micromotion_score;
         s_motion_score = raw_motion_score;
         s_stability_score = raw_stability_score;
         return;
@@ -772,333 +607,10 @@ static void smooth_scores_locked(float raw_occupancy_score,
 
     s_occupancy_score = ema_blend(s_occupancy_score, raw_occupancy_score,
                                   CSI_SCORE_ALPHA);
-    s_micromotion_score = ema_blend(s_micromotion_score, raw_micromotion_score,
-                                    CSI_SCORE_ALPHA);
     s_motion_score = ema_blend(s_motion_score, raw_motion_score,
                                CSI_SCORE_ALPHA);
     s_stability_score = ema_blend(s_stability_score, raw_stability_score,
                                   CSI_STABILITY_ALPHA);
-}
-
-static void update_selected_detector_locked(const float *raw_amps, uint8_t num_sc,
-                                            float frame_mean,
-                                            bool calibration_phase)
-{
-    float shift_sum = 0.0f;
-    float macro_sum = 0.0f;
-    float micro_sum = 0.0f;
-    uint8_t present = 0;
-    uint8_t macro_count = 0;
-    bool macro_candidate;
-    bool micro_candidate;
-    bool static_candidate;
-    bool clear_candidate;
-    csi_presence_state_t new_state;
-
-    if (!raw_amps || !isfinite(frame_mean) || frame_mean <= 0.0f) {
-        return;
-    }
-
-    for (uint8_t i = 0; i < CSI_SELECTED_SUBCARRIER_COUNT; i++) {
-        uint8_t sc = s_selected_subcarriers[i];
-        float amp;
-        float delta = 0.0f;
-
-        if (sc >= num_sc) {
-            continue;
-        }
-
-        amp = raw_amps[sc];
-        if (!isfinite(amp) || amp <= 0.0f) {
-            continue;
-        }
-        amp /= fmaxf(frame_mean, 1.0f);
-
-        if (calibration_phase || s_selected_baseline[i] <= 0.0f) {
-            s_selected_baseline[i] = (s_selected_baseline[i] <= 0.0f) ? amp :
-                ema_blend(s_selected_baseline[i], amp, 0.08f);
-        }
-
-        if (s_selected_prev_ready[i]) {
-            delta = fabsf(amp - s_selected_prev_amp[i]);
-            macro_sum += delta;
-            macro_count++;
-            s_selected_micro_ema[i] = ema_blend(s_selected_micro_ema[i],
-                                                delta, 0.18f);
-            micro_sum += s_selected_micro_ema[i];
-        }
-
-        shift_sum += fabsf(amp - s_selected_baseline[i]);
-        s_selected_prev_amp[i] = amp;
-        s_selected_prev_ready[i] = true;
-        present++;
-    }
-
-    s_selected_present_count = present;
-    if (present == 0U) {
-        return;
-    }
-
-    s_selected_shift_raw = shift_sum / (float)present;
-    s_selected_macro_raw = (macro_count == 0U) ? 0.0f :
-        (macro_sum / (float)macro_count);
-    s_selected_micro_raw = (macro_count == 0U) ? 0.0f :
-        (micro_sum / (float)macro_count);
-
-    if (calibration_phase) {
-        s_selected_shift_floor = (s_processed_frames <= 1U) ?
-            s_selected_shift_raw :
-            ema_blend(s_selected_shift_floor, s_selected_shift_raw, 0.08f);
-        s_selected_shift_jitter = ema_blend(s_selected_shift_jitter,
-            fabsf(s_selected_shift_raw - s_selected_shift_floor), 0.10f);
-        s_selected_macro_floor = (s_processed_frames <= 1U) ?
-            s_selected_macro_raw :
-            ema_blend(s_selected_macro_floor, s_selected_macro_raw, 0.08f);
-        s_selected_macro_jitter = ema_blend(s_selected_macro_jitter,
-            fabsf(s_selected_macro_raw - s_selected_macro_floor), 0.10f);
-        s_selected_micro_floor = (s_processed_frames <= 1U) ?
-            s_selected_micro_raw :
-            ema_blend(s_selected_micro_floor, s_selected_micro_raw, 0.08f);
-        s_selected_micro_jitter = ema_blend(s_selected_micro_jitter,
-            fabsf(s_selected_micro_raw - s_selected_micro_floor), 0.10f);
-        s_selected_shift_score = 0.0f;
-        s_selected_macro_score = 0.0f;
-        s_selected_micro_score = 0.0f;
-        s_selected_presence_state = CSI_PRESENCE_NO_PRESENCE;
-        s_hybrid_presence_state = CSI_PRESENCE_NO_PRESENCE;
-        return;
-    }
-
-    s_selected_shift_ref = fmaxf(CSI_SELECTED_MIN_SHIFT_REF,
-        s_selected_shift_floor + (s_selected_shift_jitter * 2.4f));
-    s_selected_macro_ref = fmaxf(CSI_SELECTED_MIN_DELTA_REF,
-        s_selected_macro_floor + (s_selected_macro_jitter * 2.2f));
-    s_selected_micro_ref = fmaxf(CSI_SELECTED_MIN_DELTA_REF,
-        s_selected_micro_floor + (s_selected_micro_jitter * 2.0f));
-    s_selected_shift_score = ema_blend(s_selected_shift_score,
-        s_selected_shift_raw / s_selected_shift_ref, 0.22f);
-    s_selected_macro_score = ema_blend(s_selected_macro_score,
-        s_selected_macro_raw / s_selected_macro_ref, 0.30f);
-    s_selected_micro_score = ema_blend(s_selected_micro_score,
-        s_selected_micro_raw / s_selected_micro_ref, 0.24f);
-
-    macro_candidate = s_selected_macro_score >= CSI_SELECTED_MACRO_ENTER;
-    micro_candidate = (s_selected_shift_score >= CSI_SELECTED_SHIFT_CLEAR) &&
-        (s_selected_macro_score < CSI_SELECTED_MACRO_ENTER) &&
-        (s_selected_micro_score >= CSI_SELECTED_MICRO_ENTER);
-    static_candidate = (s_selected_shift_score >= CSI_SELECTED_SHIFT_ENTER) &&
-        (s_selected_macro_score <= CSI_SELECTED_MACRO_CLEAR) &&
-        (s_selected_micro_score <= CSI_SELECTED_MICRO_ENTER);
-    clear_candidate = (s_selected_shift_score <= CSI_SELECTED_SHIFT_CLEAR) &&
-        (s_selected_macro_score <= CSI_SELECTED_MACRO_CLEAR) &&
-        (s_selected_micro_score <= CSI_SELECTED_MICRO_CLEAR);
-
-    s_selected_macro_frames = macro_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_selected_macro_frames + 1)) : 0;
-    s_selected_micro_frames = micro_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_selected_micro_frames + 1)) : 0;
-    s_selected_static_frames = static_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_selected_static_frames + 1)) : 0;
-    s_selected_clear_frames = clear_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_selected_clear_frames + 1)) : 0;
-
-    new_state = s_selected_presence_state;
-    if (s_selected_macro_frames >= 4U) {
-        new_state = CSI_PRESENCE_MOTION;
-    } else if (s_selected_micro_frames >= 16U) {
-        new_state = CSI_PRESENCE_MICROMOTION;
-    } else if (s_selected_static_frames >= 12U) {
-        new_state = CSI_PRESENCE_STATIC;
-    } else if (s_selected_clear_frames >= 40U) {
-        new_state = CSI_PRESENCE_NO_PRESENCE;
-    }
-    s_selected_presence_state = new_state;
-}
-
-static void update_visual_features_locked(const float *raw_amps, uint8_t num_sc,
-                                          float frame_mean,
-                                          bool calibration_phase)
-{
-    float shape_sum = 0.0f;
-    float rhythm_sum = 0.0f;
-    float patch_sum = 0.0f;
-    uint8_t shape_count = 0;
-    uint8_t rhythm_count = 0;
-    uint8_t patch_count = 0;
-    bool micro_candidate;
-
-    if (!raw_amps || !isfinite(frame_mean) || frame_mean <= 0.0f) {
-        return;
-    }
-
-    for (uint8_t sc = 0; sc < num_sc; sc++) {
-        float norm;
-        float delta = 0.0f;
-        float patch_delta;
-        float patch_threshold;
-
-        if (!is_stable_subcarrier(sc) || raw_amps[sc] <= 0.0f ||
-            !isfinite(raw_amps[sc])) {
-            continue;
-        }
-
-        norm = raw_amps[sc] / fmaxf(frame_mean, 1.0f);
-        if (calibration_phase || s_visual_baseline[sc] <= 0.0f) {
-            s_visual_baseline[sc] = (s_visual_baseline[sc] <= 0.0f) ? norm :
-                ema_blend(s_visual_baseline[sc], norm, 0.06f);
-        }
-        if (s_visual_short_ema[sc] <= 0.0f) {
-            s_visual_short_ema[sc] = norm;
-        }
-
-        shape_sum += fabsf(norm - s_visual_baseline[sc]);
-        shape_count++;
-
-        if (s_visual_prev_ready[sc]) {
-            delta = fabsf(norm - s_visual_prev_norm[sc]);
-            rhythm_sum += delta;
-            rhythm_count++;
-        }
-
-        patch_delta = fabsf(norm - s_visual_short_ema[sc]);
-        patch_threshold = fmaxf(0.025f, s_visual_patch_jitter[sc] * 3.0f);
-        if (patch_delta > patch_threshold) {
-            patch_sum += 1.0f;
-        }
-        patch_count++;
-        s_visual_patch_jitter[sc] = ema_blend(s_visual_patch_jitter[sc],
-                                              patch_delta, 0.08f);
-        s_visual_short_ema[sc] = ema_blend(s_visual_short_ema[sc], norm, 0.16f);
-        s_visual_prev_norm[sc] = norm;
-        s_visual_prev_ready[sc] = true;
-    }
-
-    if (shape_count == 0U) {
-        return;
-    }
-
-    s_shape_shift_raw = shape_sum / (float)shape_count;
-    s_rhythm_motion_raw = (rhythm_count == 0U) ? 0.0f :
-        (rhythm_sum / (float)rhythm_count);
-    s_patch_activity_raw = (patch_count == 0U) ? 0.0f :
-        ((patch_sum / (float)patch_count) * 10.0f);
-
-    if (calibration_phase) {
-        s_shape_shift_floor = (s_processed_frames <= 1U) ? s_shape_shift_raw :
-            ema_blend(s_shape_shift_floor, s_shape_shift_raw, 0.08f);
-        s_shape_shift_jitter = ema_blend(s_shape_shift_jitter,
-            fabsf(s_shape_shift_raw - s_shape_shift_floor), 0.10f);
-        s_rhythm_motion_floor = (s_processed_frames <= 1U) ? s_rhythm_motion_raw :
-            ema_blend(s_rhythm_motion_floor, s_rhythm_motion_raw, 0.08f);
-        s_rhythm_motion_jitter = ema_blend(s_rhythm_motion_jitter,
-            fabsf(s_rhythm_motion_raw - s_rhythm_motion_floor), 0.10f);
-        s_patch_activity_floor = (s_processed_frames <= 1U) ?
-            s_patch_activity_raw :
-            ema_blend(s_patch_activity_floor, s_patch_activity_raw, 0.08f);
-        s_patch_activity_jitter = ema_blend(s_patch_activity_jitter,
-            fabsf(s_patch_activity_raw - s_patch_activity_floor), 0.10f);
-        s_shape_shift_score = 0.0f;
-        s_rhythm_motion_score = 0.0f;
-        s_patch_activity_score = 0.0f;
-        s_micro_activity = false;
-        s_micro_activity_frames = 0;
-        return;
-    }
-
-    s_shape_shift_ref = fmaxf(0.035f,
-        s_shape_shift_floor + (s_shape_shift_jitter * 2.6f));
-    s_rhythm_motion_ref = fmaxf(0.020f,
-        s_rhythm_motion_floor + (s_rhythm_motion_jitter * 2.8f));
-    s_patch_activity_ref = fmaxf(0.80f,
-        s_patch_activity_floor + (s_patch_activity_jitter * 2.4f));
-    s_shape_shift_score = ema_blend(s_shape_shift_score,
-        s_shape_shift_raw / s_shape_shift_ref, 0.22f);
-    s_rhythm_motion_score = ema_blend(s_rhythm_motion_score,
-        s_rhythm_motion_raw / s_rhythm_motion_ref, 0.28f);
-    s_patch_activity_score = ema_blend(s_patch_activity_score,
-        s_patch_activity_raw / s_patch_activity_ref, 0.24f);
-
-    micro_candidate = (s_hybrid_presence_state == CSI_PRESENCE_STATIC) &&
-        (s_motion_score <= CSI_HYBRID_MOTION_CLEAR) &&
-        (s_rhythm_motion_score <= CSI_VISUAL_RHYTHM_CLEAR) &&
-        (s_selected_micro_score >= CSI_HYBRID_MICRO_ENTER);
-    s_micro_activity_frames = micro_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_micro_activity_frames + 1)) : 0;
-    if (s_micro_activity_frames >= CSI_MICRO_ACTIVITY_CONFIRM) {
-        s_micro_activity = true;
-    } else if ((s_selected_micro_score <= CSI_HYBRID_MICRO_CLEAR) ||
-               (s_hybrid_presence_state != CSI_PRESENCE_STATIC)) {
-        s_micro_activity = false;
-    }
-}
-
-static void update_hybrid_detector_locked(void)
-{
-    bool motion_candidate;
-    bool micro_candidate;
-    bool static_candidate;
-    bool clear_candidate;
-    csi_presence_state_t new_state;
-
-    if (!s_baseline_ready || s_selected_present_count == 0U) {
-        s_hybrid_presence_state = CSI_PRESENCE_NO_PRESENCE;
-        s_hybrid_motion_frames = 0;
-        s_hybrid_micro_frames = 0;
-        s_hybrid_static_frames = 0;
-        s_hybrid_clear_frames = 0;
-        s_hybrid_motion_hold_frames = 0;
-        s_hybrid_static_hold_frames = 0;
-        return;
-    }
-
-    motion_candidate = (s_motion_score >= CSI_HYBRID_MOTION_ENTER) ||
-        (s_rhythm_motion_score >= CSI_VISUAL_RHYTHM_ENTER);
-    micro_candidate = (s_selected_shift_score >= CSI_HYBRID_SHIFT_ENTER) &&
-        (s_motion_score <= CSI_HYBRID_MOTION_CLEAR) &&
-        (s_rhythm_motion_score <= CSI_VISUAL_RHYTHM_CLEAR) &&
-        (s_selected_micro_score >= CSI_HYBRID_MICRO_ENTER);
-    static_candidate = (s_selected_shift_score >= CSI_HYBRID_SHIFT_ENTER) &&
-        (s_motion_score < CSI_HYBRID_MOTION_ENTER) &&
-        (s_rhythm_motion_score < CSI_VISUAL_RHYTHM_ENTER);
-    clear_candidate = (s_occupancy_score <= CSI_HYBRID_OCCUPANCY_CLEAR) &&
-        (s_motion_score <= CSI_HYBRID_MOTION_CLEAR) &&
-        (s_rhythm_motion_score <= CSI_VISUAL_RHYTHM_CLEAR) &&
-        (s_hybrid_motion_hold_frames == 0U) &&
-        (s_hybrid_static_hold_frames == 0U);
-
-    s_hybrid_motion_frames = motion_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_hybrid_motion_frames + 1)) : 0;
-    s_hybrid_micro_frames = micro_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_hybrid_micro_frames + 1)) : 0;
-    s_hybrid_static_frames = static_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_hybrid_static_frames + 1)) : 0;
-    s_hybrid_clear_frames = clear_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_hybrid_clear_frames + 1)) : 0;
-    if (motion_candidate) {
-        s_hybrid_motion_hold_frames = CSI_HYBRID_MOTION_HOLD;
-    } else if (s_hybrid_motion_hold_frames > 0U) {
-        s_hybrid_motion_hold_frames--;
-    }
-    if (static_candidate) {
-        s_hybrid_static_hold_frames = CSI_HYBRID_STATIC_HOLD;
-    } else if (s_hybrid_static_hold_frames > 0U) {
-        s_hybrid_static_hold_frames--;
-    }
-
-    new_state = s_hybrid_presence_state;
-    if ((s_hybrid_motion_frames >= CSI_HYBRID_MOTION_CONFIRM) ||
-        ((s_hybrid_presence_state == CSI_PRESENCE_MOTION) &&
-         (s_hybrid_motion_hold_frames > 0U))) {
-        new_state = CSI_PRESENCE_MOTION;
-    } else if ((s_hybrid_static_frames >= CSI_HYBRID_STATIC_CONFIRM) ||
-               ((s_hybrid_presence_state == CSI_PRESENCE_STATIC) &&
-                (s_hybrid_static_hold_frames > 0U))) {
-        new_state = CSI_PRESENCE_STATIC;
-    } else if (s_hybrid_clear_frames >= CSI_HYBRID_CLEAR_CONFIRM) {
-        new_state = CSI_PRESENCE_NO_PRESENCE;
-    }
-
-    s_hybrid_presence_state = new_state;
 }
 
 static const char *guided_stage_to_string(csi_setup_stage_t stage)
@@ -1122,8 +634,6 @@ static const char *guided_stage_to_string(csi_setup_stage_t stage)
 
 static void reset_guided_setup_locked(void)
 {
-    bool manual_sampling = s_guided_manual_sampling;
-
     memset(s_guided_metrics, 0, sizeof(s_guided_metrics));
     s_guided_stage = CSI_SETUP_IDLE;
     s_guided_active = false;
@@ -1134,7 +644,6 @@ static void reset_guided_setup_locked(void)
     s_guided_motion_contrast = 0.0f;
     s_guided_static_contrast = 0.0f;
     s_guided_profile_applied = false;
-    s_guided_manual_sampling = manual_sampling;
     strlcpy(s_guided_profile_mode, "incomplete", sizeof(s_guided_profile_mode));
     strlcpy(s_guided_result, "incomplete", sizeof(s_guided_result));
 }
@@ -1157,22 +666,6 @@ static void prepare_guided_stage_locked(csi_setup_stage_t stage)
     s_guided_sampling = false;
     s_guided_settle_frames_remaining = CSI_GUIDED_SETTLE_FRAMES;
     clear_guided_stage_metrics_locked(stage);
-}
-
-static void maybe_start_guided_sampling_locked(void)
-{
-    if (!s_guided_active || s_guided_manual_sampling ||
-        (s_guided_stage == CSI_SETUP_IDLE) ||
-        (s_guided_stage == CSI_SETUP_COMPLETE)) {
-        return;
-    }
-
-    if (s_guided_settle_frames_remaining > 0U) {
-        s_guided_settle_frames_remaining--;
-        return;
-    }
-
-    s_guided_sampling = true;
 }
 
 static void update_guided_suggestions_locked(void)
@@ -1256,7 +749,6 @@ static void accumulate_guided_setup_locked(void)
 {
     csi_setup_metrics_t *metrics;
 
-    maybe_start_guided_sampling_locked();
     if (!s_guided_active || !s_baseline_ready ||
         !s_guided_sampling ||
         (s_guided_stage == CSI_SETUP_IDLE) ||
@@ -1271,7 +763,6 @@ static void accumulate_guided_setup_locked(void)
     metrics->samples++;
     metrics->occupancy_sum += s_occupancy_score;
     metrics->motion_sum += s_motion_score;
-    metrics->micromotion_sum += s_micromotion_score;
     metrics->stability_sum += s_stability_score;
     metrics->occupancy_peak = fmaxf(metrics->occupancy_peak, s_occupancy_score);
     metrics->motion_peak = fmaxf(metrics->motion_peak, s_motion_score);
@@ -1416,25 +907,15 @@ static void update_presence_state_locked(float occupancy_energy,
     float occupancy_ref;
     float motion_ref;
     float raw_occupancy_score;
-    float raw_micromotion_score;
     float raw_motion_score;
     float raw_stability_score;
     float presence_enter;
     float presence_clear;
-    float micro_enter;
-    float micro_clear;
     float motion_enter;
     float motion_clear;
-    float static_motion_cap_enter;
-    float static_motion_cap_hold;
-    float static_micro_cap_enter;
-    float static_micro_cap_hold;
-    float micro_motion_floor;
     bool macro_candidate;
-    bool micro_candidate;
     bool static_candidate;
     bool maintain_motion_state;
-    bool maintain_micro_state;
     bool maintain_static_state;
     bool empty_candidate;
     bool quiet_scene;
@@ -1467,7 +948,6 @@ static void update_presence_state_locked(float occupancy_energy,
                       CSI_MOTION_JITTER_ALPHA);
 
         s_occupancy_score = 0.0f;
-        s_micromotion_score = 0.0f;
         s_motion_score = 0.0f;
         s_stability_score = 1.0f;
         s_last_occupancy_energy = occupancy_energy;
@@ -1477,8 +957,6 @@ static void update_presence_state_locked(float occupancy_energy,
         s_last_motion_ref = s_motion_floor;
         s_last_motion_enter = s_detection_profile.motion_enter;
         s_last_motion_clear = 0.0f;
-        s_last_micro_enter = 0.0f;
-        s_last_micro_clear = 0.0f;
         s_last_presence_enter = 0.0f;
         s_last_presence_clear = 0.0f;
         s_presence_state = CSI_PRESENCE_NO_PRESENCE;
@@ -1523,27 +1001,18 @@ static void update_presence_state_locked(float occupancy_energy,
                        s_motion_floor + (s_motion_jitter * CSI_MOTION_JITTER_GAIN));
 
     raw_occupancy_score = occupancy_energy / occupancy_ref;
-    raw_micromotion_score = motion_avg_energy / motion_ref;
     raw_motion_score = motion_energy / motion_ref;
     raw_stability_score = occupancy_energy /
         (occupancy_energy + motion_avg_energy + 0.001f);
 
-    smooth_scores_locked(raw_occupancy_score, raw_micromotion_score,
+    smooth_scores_locked(raw_occupancy_score,
                          raw_motion_score, raw_stability_score);
-    update_hybrid_detector_locked();
     accumulate_guided_setup_locked();
 
     motion_enter = s_detection_profile.motion_enter;
     motion_clear = s_detection_profile.motion_clear;
-    micro_enter = s_detection_profile.micro_enter;
-    micro_clear = s_detection_profile.micro_clear;
     presence_enter = s_detection_profile.presence_enter;
     presence_clear = s_detection_profile.presence_clear;
-    static_motion_cap_enter = fmaxf(0.70f, motion_clear * 0.88f);
-    static_motion_cap_hold = fmaxf(0.76f, motion_clear * 0.96f);
-    static_micro_cap_enter = fmaxf(0.52f, micro_enter * 0.88f);
-    static_micro_cap_hold = fmaxf(0.58f, micro_enter * 0.96f);
-    micro_motion_floor = fmaxf(0.42f, micro_clear * 0.96f);
     s_last_occupancy_energy = occupancy_energy;
     s_last_motion_avg_energy = motion_avg_energy;
     s_last_motion_energy = motion_energy;
@@ -1551,59 +1020,40 @@ static void update_presence_state_locked(float occupancy_energy,
     s_last_motion_ref = motion_ref;
     s_last_motion_enter = motion_enter;
     s_last_motion_clear = motion_clear;
-    s_last_micro_enter = micro_enter;
-    s_last_micro_clear = micro_clear;
     s_last_presence_enter = presence_enter;
     s_last_presence_clear = presence_clear;
+
+    /* ── 3-state FSM candidates ── */
     macro_candidate = (s_motion_score >= motion_enter) &&
-        ((s_motion_score >= (s_micromotion_score + 0.12f)) ||
-         (s_motion_score >= (motion_enter * 1.10f)) ||
+        ((s_motion_score >= (motion_enter * 1.10f)) ||
          (s_presence_state == CSI_PRESENCE_MOTION));
-    micro_candidate = (s_micromotion_score >= micro_enter) &&
-        (s_motion_score < (motion_enter * 0.96f)) &&
-        ((s_occupancy_score >= (presence_clear * 0.90f)) ||
-         (s_presence_state != CSI_PRESENCE_NO_PRESENCE)) &&
-        ((s_motion_score >= micro_motion_floor) ||
-         (s_micromotion_score >= (micro_enter * 1.08f)) ||
-         (s_presence_state == CSI_PRESENCE_MICROMOTION));
     static_candidate = ((s_occupancy_score >= presence_enter) &&
         (s_stability_score >= 0.52f) &&
-        (s_motion_score <= static_motion_cap_enter) &&
-        (s_micromotion_score <= static_micro_cap_enter)) ||
+        (s_motion_score < motion_enter)) ||
         ((s_presence_state != CSI_PRESENCE_NO_PRESENCE) &&
          (s_occupancy_score >= (presence_clear * 0.98f)) &&
          (s_stability_score >= 0.42f) &&
-         (s_motion_score <= static_motion_cap_hold) &&
-         (s_micromotion_score <= static_micro_cap_hold));
+         (s_motion_score < motion_enter));
     maintain_motion_state = (s_presence_state == CSI_PRESENCE_MOTION) &&
-        ((s_motion_score >= motion_clear) ||
-         (s_micromotion_score >= (micro_enter * 0.95f)));
-    maintain_micro_state = (s_presence_state == CSI_PRESENCE_MICROMOTION) &&
-        (s_micromotion_score >= micro_clear) &&
-        (s_occupancy_score >= (presence_clear * 0.88f)) &&
-        (s_motion_score <= motion_enter);
+        (s_motion_score >= motion_clear);
     maintain_static_state = (s_presence_state == CSI_PRESENCE_STATIC) &&
         (s_occupancy_score >= (presence_clear * 0.98f)) &&
         (s_stability_score >= 0.42f) &&
-        (s_motion_score <= static_motion_cap_hold) &&
-        (s_micromotion_score <= static_micro_cap_hold);
+        (s_motion_score < motion_enter);
 
-    if (macro_candidate || micro_candidate || static_candidate ||
-        maintain_motion_state || maintain_micro_state || maintain_static_state) {
+    if (macro_candidate || static_candidate ||
+        maintain_motion_state || maintain_static_state) {
         s_presence_hold_frames = CSI_PRESENCE_HOLD_FRAMES;
     } else if (s_presence_hold_frames > 0) {
         s_presence_hold_frames--;
     }
 
     empty_candidate = (s_occupancy_score <= (presence_clear * 0.88f)) &&
-        (s_micromotion_score <= micro_clear) &&
         (s_motion_score <= motion_clear) &&
         (s_presence_hold_frames == 0);
 
     s_macro_frames = macro_candidate ?
         (uint8_t)fminf((float)UINT8_MAX, (float)(s_macro_frames + 1)) : 0;
-    s_micro_frames = micro_candidate ?
-        (uint8_t)fminf((float)UINT8_MAX, (float)(s_micro_frames + 1)) : 0;
     s_static_frames = static_candidate ?
         (uint8_t)fminf((float)UINT8_MAX, (float)(s_static_frames + 1)) : 0;
     s_clear_frames = empty_candidate ?
@@ -1612,8 +1062,6 @@ static void update_presence_state_locked(float occupancy_energy,
     new_state = s_presence_state;
     if ((s_macro_frames >= s_confirm_motion) || maintain_motion_state) {
         new_state = CSI_PRESENCE_MOTION;
-    } else if ((s_micro_frames >= CSI_MICRO_CONFIRM_FRAMES) || maintain_micro_state) {
-        new_state = CSI_PRESENCE_MICROMOTION;
     } else if ((s_static_frames >= CSI_STATIC_CONFIRM_FRAMES) || maintain_static_state) {
         new_state = CSI_PRESENCE_STATIC;
     } else if (s_clear_frames >= s_confirm_clear) {
@@ -1625,10 +1073,9 @@ static void update_presence_state_locked(float occupancy_energy,
     }
     if (s_presence_state != new_state) {
         ESP_LOGI(TAG,
-                 "Radar state -> %s (occ=%.2f micro=%.2f motion=%.2f stability=%.2f rssi=%d)",
+                 "Radar state -> %s (occ=%.2f motion=%.2f stability=%.2f rssi=%d)",
                  csi_presence_state_to_string(new_state),
                  s_occupancy_score,
-                 s_micromotion_score,
                  s_motion_score,
                  s_stability_score,
                  rssi);
@@ -1636,7 +1083,7 @@ static void update_presence_state_locked(float occupancy_energy,
     }
 
     if ((s_presence_state == CSI_PRESENCE_NO_PRESENCE) &&
-        (s_motion_score >= micro_enter) &&
+        (s_motion_score >= motion_clear) &&
         (s_occupancy_score < presence_clear) &&
         (s_disturbance_cooldown == 0)) {
         s_disturbance_event_count++;
@@ -1651,7 +1098,7 @@ static void update_presence_state_locked(float occupancy_energy,
 
     quiet_scene = (s_presence_state == CSI_PRESENCE_NO_PRESENCE) &&
         (s_occupancy_score <= presence_clear) &&
-        (s_motion_score <= micro_clear);
+        (s_motion_score <= motion_clear);
 
     if (quiet_scene) {
         adapt_empty_baseline_locked(slow_snapshot, num_sc,
@@ -1721,19 +1168,12 @@ static void log_raw_frame_locked(const csi_frame_t *frame)
                "timestamp_us,rssi,num_subcarriers,valid_subcarriers,processed_frames,"
                "packet_rate_hz,detection_enabled,baseline_ready,calibration_percent,presence_state,"
                "manual_annotation,force_calibration_enabled,calibration_guard_blocked,calibration_guard_hits,"
-               "occupancy_score,micromotion_score,motion_score,stability_score,"
+               "occupancy_score,motion_score,stability_score,"
                "occupancy_energy,motion_avg_energy,motion_energy,"
                "occupancy_ref,motion_ref,"
                "motion_threshold,motion_enter,motion_clear,"
-               "micro_enter,micro_clear,presence_enter,presence_clear,"
-               "selected_presence_state,selected_shift_score,selected_macro_score,selected_micro_score,"
-               "selected_shift_raw,selected_macro_raw,selected_micro_raw,"
-               "selected_shift_ref,selected_macro_ref,selected_micro_ref,selected_subcarrier_count,"
-               "shape_shift_score,rhythm_motion_score,patch_activity_score,"
-               "shape_shift_raw,rhythm_motion_raw,patch_activity_raw,"
-               "shape_shift_ref,rhythm_motion_ref,patch_activity_ref,micro_activity,micro_activity_frames,"
-               "hybrid_presence_state,hybrid_motion_frames,hybrid_micro_frames,hybrid_static_frames,hybrid_clear_frames,hybrid_motion_hold_frames,hybrid_static_hold_frames,"
-               "macro_frames,micro_frames,static_frames,clear_frames,presence_hold_frames,"
+               "presence_enter,presence_clear,"
+               "macro_frames,static_frames,clear_frames,presence_hold_frames,"
                "state_event_count,disturbance_count,notch_hz,last_timestamp_us,src_mac,iq_vector\n");
         s_raw_log_header_emitted = true;
     }
@@ -1766,19 +1206,12 @@ static void log_raw_frame_locked(const csi_frame_t *frame)
         s_csv_row_buf + pos, sizeof(s_csv_row_buf) - pos,
         "CSI_DATA,%llu,%d,%u,%u,%lu,%.3f,%u,%u,%u,%s,"
         "%s,%u,%u,%lu,"
-        "%.3f,%.3f,%.3f,%.3f,"
+        "%.3f,%.3f,%.3f,"
         "%.3f,%.3f,%.3f,"
         "%.3f,%.3f,"
         "%.3f,%.3f,%.3f,"
-        "%.3f,%.3f,%.3f,%.3f,"
-        "%s,%.3f,%.3f,%.3f,"
-        "%.3f,%.3f,%.3f,"
-        "%.3f,%.3f,%.3f,%u,"
-        "%.3f,%.3f,%.3f,"
-        "%.3f,%.3f,%.3f,"
-        "%.3f,%.3f,%.3f,%u,%u,"
-        "%s,%u,%u,%u,%u,%u,%u,"
-        "%u,%u,%u,%u,%u,"
+        "%.3f,%.3f,"
+        "%u,%u,%u,%u,"
         "%lu,%lu,%.3f,%llu,"
         "%02x:%02x:%02x:%02x:%02x:%02x,",
         (unsigned long long)frame->timestamp_us,
@@ -1798,7 +1231,6 @@ static void log_raw_frame_locked(const csi_frame_t *frame)
         s_calibration_guard_blocked ? 1U : 0U,
         (unsigned long)s_calibration_guard_hits,
         (double)s_occupancy_score,
-        (double)s_micromotion_score,
         (double)s_motion_score,
         (double)s_stability_score,
         (double)s_last_occupancy_energy,
@@ -1809,41 +1241,9 @@ static void log_raw_frame_locked(const csi_frame_t *frame)
         (double)s_motion_threshold,
         (double)s_last_motion_enter,
         (double)s_last_motion_clear,
-        (double)s_last_micro_enter,
-        (double)s_last_micro_clear,
         (double)s_last_presence_enter,
         (double)s_last_presence_clear,
-        csi_presence_state_to_string(s_selected_presence_state),
-        (double)s_selected_shift_score,
-        (double)s_selected_macro_score,
-        (double)s_selected_micro_score,
-        (double)s_selected_shift_raw,
-        (double)s_selected_macro_raw,
-        (double)s_selected_micro_raw,
-        (double)s_selected_shift_ref,
-        (double)s_selected_macro_ref,
-        (double)s_selected_micro_ref,
-        (unsigned)s_selected_present_count,
-        (double)s_shape_shift_score,
-        (double)s_rhythm_motion_score,
-        (double)s_patch_activity_score,
-        (double)s_shape_shift_raw,
-        (double)s_rhythm_motion_raw,
-        (double)s_patch_activity_raw,
-        (double)s_shape_shift_ref,
-        (double)s_rhythm_motion_ref,
-        (double)s_patch_activity_ref,
-        s_micro_activity ? 1U : 0U,
-        (unsigned)s_micro_activity_frames,
-        csi_presence_state_to_string(s_hybrid_presence_state),
-        (unsigned)s_hybrid_motion_frames,
-        (unsigned)s_hybrid_micro_frames,
-        (unsigned)s_hybrid_static_frames,
-        (unsigned)s_hybrid_clear_frames,
-        (unsigned)s_hybrid_motion_hold_frames,
-        (unsigned)s_hybrid_static_hold_frames,
         (unsigned)s_macro_frames,
-        (unsigned)s_micro_frames,
         (unsigned)s_static_frames,
         (unsigned)s_clear_frames,
         (unsigned)s_presence_hold_frames,
@@ -1980,10 +1380,6 @@ static void process_csi_frame(const csi_frame_t *frame)
         return;
     }
 
-    update_selected_detector_locked(raw_amps, num_sc, frame_mean,
-                                    s_calibration_frames_remaining > 0U);
-    update_visual_features_locked(raw_amps, num_sc, frame_mean,
-                                    s_calibration_frames_remaining > 0U);
     update_presence_state_locked(
         occupancy_sum / (float)valid_sc,
         motion_sum / (float)valid_sc,
@@ -2314,12 +1710,12 @@ static void led_status_task(void *arg)
 
         state = s_presence_state;
     if (!s_detection_enabled) {
-        gpio_set_level(BOARD_LED_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    } else if (state == CSI_PRESENCE_MOTION) {
-        gpio_set_level(BOARD_LED_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        } else if (state == CSI_PRESENCE_MICROMOTION) {
+            gpio_set_level(BOARD_LED_GPIO, 1);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        } else if (state == CSI_PRESENCE_MOTION) {
+            gpio_set_level(BOARD_LED_GPIO, 0);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        } else if (state == CSI_PRESENCE_STATIC) {
             gpio_set_level(BOARD_LED_GPIO, 0);
             vTaskDelay(pdMS_TO_TICKS(50));
             gpio_set_level(BOARD_LED_GPIO, 1);
@@ -2528,7 +1924,6 @@ void csi_engine_get_status(csi_status_t *out)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     out->presence_state = s_presence_state;
     out->occupancy_score = s_occupancy_score;
-    out->micromotion_score = s_micromotion_score;
     out->motion_score = s_motion_score;
     out->stability_score = s_stability_score;
     out->packet_rate_hz = s_packet_rate_hz;
@@ -2541,39 +1936,8 @@ void csi_engine_get_status(csi_status_t *out)
     out->motion_ref = s_last_motion_ref;
     out->motion_enter_threshold = s_last_motion_enter;
     out->motion_clear_threshold = s_last_motion_clear;
-    out->micro_enter_threshold = s_last_micro_enter;
-    out->micro_clear_threshold = s_last_micro_clear;
     out->presence_enter_threshold = s_last_presence_enter;
     out->presence_clear_threshold = s_last_presence_clear;
-    out->selected_presence_state = s_selected_presence_state;
-    out->hybrid_presence_state = s_hybrid_presence_state;
-    out->selected_shift_score = s_selected_shift_score;
-    out->selected_macro_score = s_selected_macro_score;
-    out->selected_micro_score = s_selected_micro_score;
-    out->selected_shift_raw = s_selected_shift_raw;
-    out->selected_macro_raw = s_selected_macro_raw;
-    out->selected_micro_raw = s_selected_micro_raw;
-    out->selected_shift_ref = s_selected_shift_ref;
-    out->selected_macro_ref = s_selected_macro_ref;
-    out->selected_micro_ref = s_selected_micro_ref;
-    out->shape_shift_score = s_shape_shift_score;
-    out->rhythm_motion_score = s_rhythm_motion_score;
-    out->patch_activity_score = s_patch_activity_score;
-    out->shape_shift_raw = s_shape_shift_raw;
-    out->rhythm_motion_raw = s_rhythm_motion_raw;
-    out->patch_activity_raw = s_patch_activity_raw;
-    out->shape_shift_ref = s_shape_shift_ref;
-    out->rhythm_motion_ref = s_rhythm_motion_ref;
-    out->patch_activity_ref = s_patch_activity_ref;
-    out->micro_activity = s_micro_activity;
-    out->micro_activity_frames = s_micro_activity_frames;
-    out->selected_subcarrier_count = s_selected_present_count;
-    out->hybrid_motion_frames = s_hybrid_motion_frames;
-    out->hybrid_micro_frames = s_hybrid_micro_frames;
-    out->hybrid_static_frames = s_hybrid_static_frames;
-    out->hybrid_clear_frames = s_hybrid_clear_frames;
-    out->hybrid_motion_hold_frames = s_hybrid_motion_hold_frames;
-    out->hybrid_static_hold_frames = s_hybrid_static_hold_frames;
     out->num_subcarriers = s_num_sc;
     out->valid_subcarriers = s_valid_sc;
     out->state_event_count = s_state_event_count;
@@ -2581,7 +1945,6 @@ void csi_engine_get_status(csi_status_t *out)
     out->processed_frame_count = s_processed_frames;
     out->queue_drop_count = s_csi_queue_drops;
     out->macro_frames = s_macro_frames;
-    out->micro_frames = s_micro_frames;
     out->static_frames = s_static_frames;
     out->clear_frames = s_clear_frames;
     out->presence_hold_frames = s_presence_hold_frames;
@@ -2634,7 +1997,6 @@ void csi_engine_get_status(csi_status_t *out)
     out->guided_suggested_presence_enter =
         s_guided_suggested_presence_enter;
     out->guided_profile_applied = s_guided_profile_applied;
-    out->guided_manual_sampling = s_guided_manual_sampling;
     out->guided_sampling = s_guided_sampling;
     out->guided_settle_frames_remaining = s_guided_settle_frames_remaining;
     out->guided_motion_contrast = s_guided_motion_contrast;
@@ -2709,10 +2071,6 @@ void csi_engine_set_profile_threshold(const char *name, float threshold)
         profile.motion_enter = threshold;
     } else if (strcmp(name, "motion_clear") == 0) {
         profile.motion_clear = threshold;
-    } else if (strcmp(name, "micro_enter") == 0) {
-        profile.micro_enter = threshold;
-    } else if (strcmp(name, "micro_clear") == 0) {
-        profile.micro_clear = threshold;
     } else if (strcmp(name, "presence_enter") == 0) {
         profile.presence_enter = threshold;
     } else if (strcmp(name, "presence_clear") == 0) {
@@ -2941,27 +2299,6 @@ void csi_engine_guided_setup_apply_profile(void)
     xSemaphoreGive(s_mutex);
 
     ESP_LOGI(TAG, "Guided setup profile applied.");
-}
-
-void csi_engine_guided_setup_set_manual_sampling(bool enabled)
-{
-    if (!s_mutex) {
-        return;
-    }
-
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_guided_manual_sampling = enabled;
-    if (s_guided_active &&
-        (s_guided_stage != CSI_SETUP_IDLE) &&
-        (s_guided_stage != CSI_SETUP_COMPLETE)) {
-        s_guided_sampling = false;
-        s_guided_settle_frames_remaining = enabled ? 0U : CSI_GUIDED_SETTLE_FRAMES;
-        clear_guided_stage_metrics_locked(s_guided_stage);
-    }
-    xSemaphoreGive(s_mutex);
-
-    ESP_LOGI(TAG, "Guided setup manual sampling %s.",
-             enabled ? "enabled" : "disabled");
 }
 
 void csi_engine_guided_setup_start_sampling(void)
